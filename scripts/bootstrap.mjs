@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Idempotent dependency bootstrap for TimeIQ worktree sessions.
+// Idempotent dependency bootstrap for OperationsIQ worktree sessions.
 //
 // Every git worktree is a separate directory, and node_modules / .venv are
 // git-ignored and live inside the working dir — so a fresh session starts with

@@ -88,7 +88,7 @@ To build for a different host (e.g. GitHub Pages, or any static host), set both:
 
 ```powershell
 $env:DOCS_URL = 'https://slavatrofimov.github.io'
-$env:DOCS_BASE_URL = '/TimeIQ/'
+$env:DOCS_BASE_URL = '/OperationsIQ/'
 npm run build
 ```
 

@@ -43,7 +43,7 @@ engine the app team uses, so the deployed agent always matches the app's tools.
 Authentication uses an `az` token for the `https://ai.azure.com/.default` scope,
 so `az login` with an identity that has the project **data-scientist** role.
 
-See [foundry-tool-catalog-provisioning](https://github.com/slavatrofimov/TimeIQ)
+See [foundry-tool-catalog-provisioning](https://github.com/slavatrofimov/OperationsIQ)
 (`OperationsIQApp/docs/foundry-tool-catalog-provisioning.md`) for the full
 runbook.
 

@@ -32,7 +32,7 @@ const config: Config = {
 
   // Used for the GitHub link/edit URLs (repo owner + name).
   organizationName: 'slavatrofimov',
-  projectName: 'TimeIQ',
+  projectName: 'OperationsIQ',
   trailingSlash: false,
 
   onBrokenLinks: 'throw',
@@ -58,7 +58,7 @@ const config: Config = {
           routeBasePath: 'user',
           sidebarPath: './sidebars/user.ts',
           editUrl:
-            'https://github.com/slavatrofimov/TimeIQ/tree/main/docs-site/',
+            'https://github.com/slavatrofimov/OperationsIQ/tree/main/docs-site/',
         },
         blog: false,
         theme: {
@@ -76,7 +76,7 @@ const config: Config = {
         path: 'docs/admin',
         routeBasePath: 'admin',
         sidebarPath: './sidebars/admin.ts',
-        editUrl: 'https://github.com/slavatrofimov/TimeIQ/tree/main/docs-site/',
+        editUrl: 'https://github.com/slavatrofimov/OperationsIQ/tree/main/docs-site/',
       },
     ],
     [
@@ -86,7 +86,7 @@ const config: Config = {
         path: 'docs/dev',
         routeBasePath: 'dev',
         sidebarPath: './sidebars/dev.ts',
-        editUrl: 'https://github.com/slavatrofimov/TimeIQ/tree/main/docs-site/',
+        editUrl: 'https://github.com/slavatrofimov/OperationsIQ/tree/main/docs-site/',
       },
     ],
   ],
@@ -141,7 +141,7 @@ const config: Config = {
           label: 'Developer Guide',
         },
         {
-          href: 'https://github.com/slavatrofimov/TimeIQ',
+          href: 'https://github.com/slavatrofimov/OperationsIQ',
           label: 'GitHub',
           position: 'right',
         },
@@ -169,7 +169,7 @@ const config: Config = {
         {
           title: 'More',
           items: [
-            {label: 'GitHub', href: 'https://github.com/slavatrofimov/TimeIQ'},
+            {label: 'GitHub', href: 'https://github.com/slavatrofimov/OperationsIQ'},
           ],
         },
       ],
