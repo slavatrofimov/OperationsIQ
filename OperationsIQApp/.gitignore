@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.temp/
+
+# Local env (never commit real IDs/keys)
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.DS_Store
+*.log
+
+# Python (orchestration + spark compute plane)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Rayfin CLI compiled schema output
+rayfin/.temp/
+
+# Generated Foundry agent body (emit artifact, not source of truth)
+agent-tools.generated.json

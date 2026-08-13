@@ -1,0 +1,12 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "Lakehouse",
+    "displayName": "OperationsIQ",
+    "description": "Operations IQ lakehouse — runs the Livy/Spark Matrix Profile pattern analyses."
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "467cd3be-3566-4727-9763-fbca52368dd0"
+  }
+}

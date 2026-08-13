@@ -1,0 +1,156 @@
+// SAX-VSM interpretable classification.
+
+.create-or-alter function with (
+    folder = "SAX/VSM",
+    docstring = "Build SAX word bags from labeled training series."
+) sax_vsm_wordbag(
+    Training:(class_label:string, series_id:string, series:dynamic),
+    window_size:int,
+    paa_size:int,
+    alphabet_size:int,
+    znorm_threshold:real,
+    numerosity_reduction:string)
+{
+    let alphabet = sax_alphabet(alphabet_size);
+    Training
+    | extend series_length = array_length(series),
+             breakpoints = sax_breakpoints_gaussian(alphabet_size)
+    | where series_length >= window_size
+    | mv-expand start_index = range(0, series_length - window_size, 1) to typeof(long)
+    | extend window_series = array_slice(series, start_index, start_index + window_size - 1)
+    | extend znormed = sax_znorm(window_series, znorm_threshold)
+    // Row-safe inline SAX word (see sax_discords for rationale): the scalar
+    // sax_word helper cannot run in a per-row context.
+    | mv-apply seg_k = range(0, paa_size - 1, 1) to typeof(long) on (
+        extend _seg_start = toint(floor(todouble(seg_k) * todouble(window_size) / todouble(paa_size), 1))
+        | extend _seg_end = max_of(_seg_start, toint(floor(todouble(seg_k + 1) * todouble(window_size) / todouble(paa_size), 1)) - 1)
+        | extend _seg_slice = array_slice(znormed, _seg_start, _seg_end)
+        | extend _paa_v = todouble(array_sum(_seg_slice)) / todouble(_seg_end - _seg_start + 1)
+        | extend _sym_idx = toint(array_sum(series_greater_equals(repeat(_paa_v, array_length(breakpoints)), breakpoints))) - 1
+        | extend _sym = tostring(alphabet[_sym_idx])
+        | summarize word = strcat_array(make_list(_sym), "")
+    )
+    | order by class_label asc, series_id asc, start_index asc
+    | serialize previous_key = strcat(prev(class_label), "|", prev(series_id)),
+                previous_word = prev(word)
+    | extend current_key = strcat(class_label, "|", series_id)
+    | where numerosity_reduction != "exact" or current_key != previous_key or word != previous_word
+    | summarize term_frequency = count() by class_label, word
+}
+
+.create-or-alter function with (
+    folder = "SAX/VSM",
+    docstring = "Train SAX-VSM class TF-IDF vectors using ln(1 + tf) * ln(N / df)."
+) sax_vsm_train(
+    Training:(class_label:string, series_id:string, series:dynamic),
+    window_size:int,
+    paa_size:int,
+    alphabet_size:int,
+    znorm_threshold:real,
+    numerosity_reduction:string,
+    drop_terms_in_all_classes:bool)
+{
+    let Bags = sax_vsm_wordbag(Training, window_size, paa_size, alphabet_size, znorm_threshold, numerosity_reduction);
+    let ClassCount = toscalar(Bags | summarize dcount(class_label));
+    Bags
+    | summarize class_tf = sum(term_frequency) by class_label, word
+    | join kind=inner (
+        Bags
+        | summarize document_frequency = dcount(class_label) by word
+    ) on word
+    | where not(drop_terms_in_all_classes and document_frequency == ClassCount)
+    | extend tf = log(1.0 + todouble(class_tf)),
+             idf = log(todouble(ClassCount) / todouble(document_frequency))
+    | extend weight = tf * idf
+    | project class_label, word, term_frequency = class_tf, document_frequency, class_count = ClassCount, tf, idf, weight
+}
+
+.create-or-alter function with (
+    folder = "SAX/VSM",
+    docstring = "Classify input series against a SAX-VSM model and return per-class scores plus interpretable contributing words."
+) sax_vsm_classify(
+    Model:(class_label:string, word:string, weight:real),
+    Input:(series_id:string, series:dynamic),
+    window_size:int,
+    paa_size:int,
+    alphabet_size:int,
+    znorm_threshold:real,
+    numerosity_reduction:string,
+    top_words:int)
+{
+    let alphabet = sax_alphabet(alphabet_size);
+    let Classes =
+        Model
+        | summarize model_norm = sqrt(sum(weight * weight)) by class_label;
+    let InputBags =
+        Input
+        | extend series_length = array_length(series),
+                 breakpoints = sax_breakpoints_gaussian(alphabet_size)
+        | where series_length >= window_size
+        | mv-expand start_index = range(0, series_length - window_size, 1) to typeof(long)
+        | extend window_series = array_slice(series, start_index, start_index + window_size - 1)
+        | extend znormed = sax_znorm(window_series, znorm_threshold)
+        // Row-safe inline SAX word (see sax_discords for rationale).
+        | mv-apply seg_k = range(0, paa_size - 1, 1) to typeof(long) on (
+            extend _seg_start = toint(floor(todouble(seg_k) * todouble(window_size) / todouble(paa_size), 1))
+            | extend _seg_end = max_of(_seg_start, toint(floor(todouble(seg_k + 1) * todouble(window_size) / todouble(paa_size), 1)) - 1)
+            | extend _seg_slice = array_slice(znormed, _seg_start, _seg_end)
+            | extend _paa_v = todouble(array_sum(_seg_slice)) / todouble(_seg_end - _seg_start + 1)
+            | extend _sym_idx = toint(array_sum(series_greater_equals(repeat(_paa_v, array_length(breakpoints)), breakpoints))) - 1
+            | extend _sym = tostring(alphabet[_sym_idx])
+            | summarize word = strcat_array(make_list(_sym), "")
+        )
+        | order by series_id asc, start_index asc
+        | serialize previous_series = prev(series_id), previous_word = prev(word)
+        | where numerosity_reduction != "exact" or series_id != previous_series or word != previous_word
+        | summarize input_tf = count() by series_id, word;
+    let InputNorms =
+        InputBags
+        | summarize input_norm = sqrt(sum(todouble(input_tf) * todouble(input_tf))) by series_id;
+    let Contributions =
+        InputBags
+        | join kind=inner Model on word
+        | extend contribution = weight * todouble(input_tf)
+        | project series_id, class_label, word, input_tf, weight, contribution;
+    let ClassScores =
+        Input
+        | project series_id
+        | extend join_key = 1
+        | join kind=inner (Classes | extend join_key = 1) on join_key
+        | project series_id, class_label, model_norm
+        | join kind=leftouter (InputNorms) on series_id
+        | join kind=leftouter (
+            Contributions
+            | summarize dot_product = sum(contribution) by series_id, class_label
+        ) on series_id, class_label
+        | extend input_norm = coalesce(input_norm, real(0)),
+                 dot_product = coalesce(dot_product, real(0))
+        | extend cosine_similarity = iff(model_norm == 0.0 or input_norm == 0.0, real(0), dot_product / (model_norm * input_norm))
+        | extend cosine_distance = 1.0 - cosine_similarity;
+    let TopWords =
+        Contributions
+        | order by series_id asc, class_label asc, contribution desc
+        | serialize contribution_rank = row_number(1, prev(series_id) != series_id or prev(class_label) != class_label)
+        | where contribution_rank <= top_words
+        | summarize top_contributing_words = make_list(bag_pack("word", word, "input_tf", input_tf, "weight", weight, "contribution", contribution)) by series_id, class_label;
+    ClassScores
+    | join kind=leftouter TopWords on series_id, class_label
+    | summarize
+        class_scores = make_list(bag_pack("class_label", class_label, "cosine_similarity", cosine_similarity, "cosine_distance", cosine_distance, "top_words", top_contributing_words)),
+        best_similarity = max(cosine_similarity),
+        distinct_scores = dcount(cosine_similarity)
+      by series_id
+    | mv-expand class_score = class_scores
+    | extend class_label = tostring(class_score.class_label),
+             cosine_similarity = todouble(class_score.cosine_similarity)
+    | where cosine_similarity == best_similarity
+    | summarize best_class_count = count(),
+                predicted_class_value = any(class_label),
+                confidence = any(best_similarity),
+                distinct_scores = any(distinct_scores),
+                class_scores = any(class_scores)
+      by series_id
+    | extend is_ambiguous = distinct_scores <= 1 or best_class_count > 1
+    | extend predicted_class = iff(is_ambiguous, "", predicted_class_value)
+    | project series_id, predicted_class, confidence, is_ambiguous, class_scores
+}

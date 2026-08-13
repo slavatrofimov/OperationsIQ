@@ -1,0 +1,8 @@
+{
+  "label": "Personas",
+  "position": 9,
+  "link": {
+    "type": "doc",
+    "id": "personas/index"
+  }
+}

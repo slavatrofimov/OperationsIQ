@@ -1,0 +1,366 @@
+// ============================================================================
+// Operations IQ - multivariate anomaly detection core
+// ----------------------------------------------------------------------------
+// PURPOSE
+//   Converts long/narrow observations into aligned, quality-described arrays and
+//   supplies the row-safe helpers and entity diagnostics shared by every MVAD
+//   detector in schema/81-84.
+//
+// PREPARED-SERIES CONTRACT
+//   entity_id:string, track_id:string, series:dynamic,
+//   series_start:datetime, series_end:datetime (exclusive), bin_size:timespan,
+//   point_count:long, observed_bins:long, coverage:real,
+//   max_missing_run:long, is_valid:bool, validation_error:string
+//
+// COMMON DETECTOR RESULT CONTRACT
+//   entity_id:string, algorithm:string, event_index:long, event_time:datetime,
+//   window_start:datetime, window_end:datetime, score:real, threshold:real,
+//   severity:real, is_anomaly:bool, vote_count:long, vote_fraction:real,
+//   track_count:long, contributors:dynamic, status:string, explain:dynamic
+//
+// MEMORY MODEL
+//   mvad_make_series expands one compact observed/not-observed mask per track to
+//   measure the longest source gap, then immediately collapses it to one row.
+//   Full timestamp arrays are never materialized; event time is reconstructed as
+//   series_start + event_index * bin_size.
+//
+// EXAMPLE
+//   let Source = Timeseries
+//       | where Timestamp >= datetime(2024-01-01) and Timestamp < datetime(2024-01-02)
+//       | project entity_id="asset-01", track_id=TagId, timestamp=Timestamp, value=Value;
+//   mvad_make_series(Source, datetime(2024-01-01), datetime(2024-01-02), 5m, 0.95, 3)
+// ============================================================================
+
+.create-or-alter function with (
+    folder = "MVAD/Core",
+    docstring = "Decode one hexadecimal digit. Used to derive stable sparse projection weights from SHA-256 text."
+) mvad_hex_digit(hex_digit:string)
+{
+    indexof("0123456789abcdef", tolower(hex_digit))
+}
+
+.create-or-alter function with (
+    folder = "MVAD/Core",
+    docstring = "Standardize a series using only the historical prefix before the final test_points. Low-variance history is mean-centered without unsafe division."
+) mvad_standardize_from_history(series:dynamic, test_points:int, stdev_floor:real)
+{
+    let _n = array_length(series);
+    let _history_end = _n - test_points - 1;
+    let _history = array_slice(series, 0, _history_end);
+    let _stats = series_stats_dynamic(_history);
+    let _mean = todouble(_stats.avg);
+    let _sample_variance = todouble(_stats.variance);
+    let _history_n = array_length(_history);
+    // series_stats_dynamic reports sample variance. Convert it to population
+    // variance so normalization does not change with the chosen history length.
+    let _population_variance =
+        iff(_history_n > 1, _sample_variance * todouble(_history_n - 1) / todouble(_history_n), 0.0);
+    let _stdev = sqrt(max_of(0.0, _population_variance));
+    let _centered = series_subtract(series, repeat(_mean, _n));
+    iff(
+        isfinite(_stdev) and _stdev >= stdev_floor,
+        series_divide(_centered, repeat(_stdev, _n)),
+        _centered
+    )
+}
+
+.create-or-alter function with (
+    folder = "MVAD/Core",
+    docstring = "Remove parameterized seasonal structure with a causal same-phase lag. Returns the original series when seasonality is zero."
+) mvad_causal_deseason(series:dynamic, seasonality:int)
+{
+    let _n = array_length(series);
+    // series_decompose requires literal Seasonality/Trend/Test_points values when
+    // validated inside a stored function. A same-phase lag is fully vectorized,
+    // accepts a UDF parameter, and is causal: no final-window value can alter an
+    // earlier estimate.
+    let _seasonal_lag = iff(
+        seasonality > 0,
+        series_fir(
+            series,
+            array_concat(repeat(0.0, seasonality), dynamic([1.0])),
+            false,
+            false
+        ),
+        repeat(0.0, _n)
+    );
+    iff(seasonality > 0, series_subtract(series, _seasonal_lag), series)
+}
+
+.create-or-alter function with (
+    folder = "MVAD/Core",
+    docstring = "Return a causal seasonal/trend residual using parameter-safe FIR predictors for none, average, or local-linear trend modes."
+) mvad_causal_residual(series:dynamic, seasonality:int, trend:string)
+{
+    let _n = array_length(series);
+    let _deseasonalized = mvad_causal_deseason(series, seasonality);
+    // Keep the trend horizon bounded even for long seasonal periods. Coefficient
+    // index zero is the current point, so a leading zero excludes the point being
+    // scored from its own trend prediction.
+    let _trend_window = toint(max_of(4, min_of(64, iff(seasonality > 1, seasonality, 8))));
+    let _recent_filter = array_concat(
+        dynamic([0.0]),
+        repeat(1.0 / todouble(_trend_window), _trend_window)
+    );
+    let _prior_filter = array_concat(
+        dynamic([0.0]),
+        repeat(0.0, _trend_window),
+        repeat(1.0 / todouble(_trend_window), _trend_window)
+    );
+    let _recent_mean = series_fir(_deseasonalized, _recent_filter, false, false);
+    let _prior_mean = series_fir(_deseasonalized, _prior_filter, false, false);
+    let _trend_prediction = case(
+        trend == "none", repeat(0.0, _n),
+        trend == "avg", _recent_mean,
+        // Two adjacent causal means provide a bounded local-linear extrapolation.
+        series_subtract(series_multiply(repeat(2.0, _n), _recent_mean), _prior_mean)
+    );
+    series_subtract(_deseasonalized, _trend_prediction)
+}
+
+.create-or-alter function with (
+    folder = "MVAD/Core",
+    docstring = "Create aligned regular MVAD series from long/narrow observations while retaining source coverage and longest-gap diagnostics."
+) mvad_make_series(
+    Source:(entity_id:string, track_id:string, timestamp:datetime, value:real),
+    range_start:datetime,
+    range_end:datetime,
+    bin_size:timespan,
+    min_coverage:real,
+    max_gap_bins:int)
+{
+    let _parameters_are_valid = assert(
+        range_start < range_end
+            and bin_size > 0s
+            and min_coverage >= 0.0
+            and min_coverage <= 1.0
+            and max_gap_bins >= 0
+            and tolong((range_end - range_start) / bin_size) <= 1048576,
+        "mvad_make_series: require range_start < range_end, bin_size > 0, min_coverage in [0,1], max_gap_bins >= 0, and at most 1,048,576 bins."
+    );
+    let _made =
+        materialize(
+            Source
+            | where _parameters_are_valid
+            | where timestamp >= range_start and timestamp < range_end
+            // Non-finite values are treated as missing observations. Duplicate
+            // finite samples in one bin are reduced with avgif().
+            | make-series
+                _raw_series = avgif(value, isfinite(value)) default=real(null),
+                _observed = countif(isfinite(value)) default=long(0)
+              on timestamp from range_start to range_end step bin_size
+              by entity_id, track_id
+            | project entity_id, track_id, _raw_series, _observed
+        );
+    let _missing_runs =
+        _made
+        | project entity_id, track_id, _observed
+        | mv-expand with_itemindex=_index _count = _observed to typeof(long)
+        | extend _index = tolong(_index), _is_missing = _count <= 0
+        | order by entity_id asc, track_id asc, _index asc
+        | serialize
+        // scan carries only three scalars. The expanded mask is collapsed in the
+        // following summarize and never joins an algorithm's expensive stages.
+        | scan declare (
+            _scan_entity:string = "",
+            _scan_track:string = "",
+            _run:long = 0
+        ) with (
+            step s: true =>
+                _run = iff(
+                    _is_missing,
+                    iff(entity_id == s._scan_entity and track_id == s._scan_track, s._run + 1, 1),
+                    0
+                ),
+                _scan_entity = entity_id,
+                _scan_track = track_id;
+        )
+        | summarize max_missing_run = max(_run) by entity_id, track_id;
+    _made
+    | extend
+        point_count = tolong(array_length(_raw_series)),
+        // _observed contains per-bin row counts, not a Boolean mask. Convert it
+        // before summing so duplicate/sub-bin samples cannot inflate coverage
+        // above 1.0 or hide genuinely empty bins.
+        observed_bins = tolong(array_sum(
+            series_greater(_observed, repeat(0, array_length(_observed)))
+        ))
+    | extend
+        coverage = iff(point_count > 0, todouble(observed_bins) / todouble(point_count), 0.0),
+        // series_fill_linear fills internal and edge gaps. Preserve an all-null
+        // track instead of allowing a fill routine to synthesize zero-valued data.
+        series = iff(
+            observed_bins > 0,
+            series_fill_linear(_raw_series, real(null), true),
+            _raw_series
+        )
+    | join kind=leftouter _missing_runs on entity_id, track_id
+    | extend max_missing_run = coalesce(max_missing_run, point_count)
+    | extend _stats = series_stats_dynamic(series)
+    | extend _is_finite =
+        observed_bins > 0
+            and isfinite(todouble(_stats.min))
+            and isfinite(todouble(_stats.max))
+    | extend validation_error = case(
+        point_count <= 0, "empty_series",
+        observed_bins <= 0, "no_finite_observations",
+        coverage < min_coverage, "insufficient_coverage",
+        max_missing_run > tolong(max_gap_bins), "max_gap_exceeded",
+        not(_is_finite), "nonfinite_after_fill",
+        ""
+    )
+    | extend is_valid = validation_error == ""
+    | project
+        entity_id,
+        track_id,
+        series,
+        series_start = range_start,
+        series_end = range_end,
+        bin_size,
+        point_count,
+        observed_bins,
+        coverage,
+        max_missing_run,
+        is_valid,
+        validation_error
+}
+
+.create-or-alter function with (
+    folder = "MVAD/Core",
+    docstring = "Summarize canonical prepared tracks into one entity validation row for all MVAD detectors."
+) mvad_entity_profile(
+    SeriesTable:(
+        entity_id:string,
+        track_id:string,
+        series:dynamic,
+        series_start:datetime,
+        series_end:datetime,
+        bin_size:timespan,
+        point_count:long,
+        observed_bins:long,
+        coverage:real,
+        max_missing_run:long,
+        is_valid:bool,
+        validation_error:string
+    ),
+    detection_window:timespan,
+    min_history_points:long)
+{
+    let _parameters_are_valid = assert(
+        detection_window > 0s and min_history_points >= 1,
+        "mvad_entity_profile: detection_window must be positive and min_history_points must be at least 1."
+    );
+    SeriesTable
+    | where _parameters_are_valid
+    | summarize
+        track_count = dcount(track_id),
+        valid_track_count = dcountif(track_id, is_valid),
+        invalid_track_count = dcountif(track_id, not(is_valid)),
+        _start_count = dcount(series_start),
+        _end_count = dcount(series_end),
+        _bin_count = dcount(bin_size),
+        _point_count_count = dcount(point_count),
+        series_start = min(series_start),
+        series_end = max(series_end),
+        bin_size = min(bin_size),
+        point_count = max(point_count),
+        _quality_errors = make_set_if(validation_error, validation_error != "", 16)
+      by entity_id
+    // Direct tolong() truncation is intentional here. Kusto's stored-function
+    // validator rejects floor() over a timespan/timespan expression even though
+    // the equivalent ad-hoc scalar expression succeeds; the alignment check
+    // below still rejects any non-integer ratio.
+    | extend _detection_bins_real = detection_window / bin_size
+    | extend detection_bins = tolong(_detection_bins_real)
+    | extend
+        _clock_aligned =
+            _start_count == 1
+            and _end_count == 1
+            and _bin_count == 1
+            and _point_count_count == 1
+            and series_end == series_start + point_count * bin_size,
+        _window_aligned =
+            detection_bins >= 1
+            and abs(_detection_bins_real - todouble(detection_bins)) < 1e-9,
+        _has_coverage_error =
+            array_index_of(_quality_errors, "insufficient_coverage") >= 0
+            or array_index_of(_quality_errors, "max_gap_exceeded") >= 0
+    | extend status = case(
+        not(_clock_aligned) or not(_window_aligned), "misaligned_series",
+        track_count < 2, "invalid_input",
+        invalid_track_count > 0 and _has_coverage_error, "insufficient_coverage",
+        invalid_track_count > 0, "invalid_input",
+        point_count - detection_bins < min_history_points, "insufficient_history",
+        "ok"
+    )
+    | extend detail = case(
+        status == "misaligned_series", "Tracks must share one start, end, bin size, point count, and an integer detection-window bin count.",
+        status == "invalid_input" and track_count < 2, "At least two prepared tracks are required.",
+        status == "insufficient_coverage", strcat("One or more tracks failed coverage/gap validation: ", tostring(_quality_errors)),
+        status == "invalid_input", strcat("One or more tracks failed preparation validation: ", tostring(_quality_errors)),
+        status == "insufficient_history", strcat("Need at least ", min_history_points, " historical bins before the detection window."),
+        ""
+    )
+    | project
+        entity_id,
+        series_start,
+        series_end,
+        bin_size,
+        point_count,
+        detection_bins,
+        track_count = tolong(track_count),
+        valid_track_count = tolong(valid_track_count),
+        invalid_track_count = tolong(invalid_track_count),
+        status,
+        detail
+}
+
+.create-or-alter function with (
+    folder = "MVAD/Core",
+    docstring = "Convert non-ok MVAD entity profiles into the common detector result schema. Diagnostics are never suppressed by anomaly-only mode."
+) mvad_diagnostic_results(
+    EntityProfile:(
+        entity_id:string,
+        series_start:datetime,
+        series_end:datetime,
+        bin_size:timespan,
+        point_count:long,
+        detection_bins:long,
+        track_count:long,
+        valid_track_count:long,
+        invalid_track_count:long,
+        status:string,
+        detail:string
+    ),
+    algorithm:string)
+{
+    EntityProfile
+    | where status != "ok"
+    | project
+        entity_id,
+        algorithm,
+        event_index = tolong(-1),
+        event_time = series_end,
+        window_start = iff(
+            detection_bins >= 1 and detection_bins <= point_count,
+            series_start + (point_count - detection_bins) * bin_size,
+            series_start
+        ),
+        window_end = series_end,
+        score = real(null),
+        threshold = real(null),
+        severity = real(null),
+        is_anomaly = false,
+        vote_count = tolong(0),
+        vote_fraction = real(0),
+        track_count,
+        contributors = dynamic([]),
+        status,
+        explain = bag_pack(
+            "detail", detail,
+            "point_count", point_count,
+            "detection_bins", detection_bins,
+            "valid_track_count", valid_track_count,
+            "invalid_track_count", invalid_track_count
+        )
+}

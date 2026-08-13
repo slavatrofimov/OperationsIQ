@@ -1,0 +1,277 @@
+// Query-aware multi-dimensional SAX search over a long/narrow schema.
+// Uses segment-first vectorized architecture with automatic memory batching:
+//   Batching: hash entities into buckets sized to a fixed expand budget (all tracks
+//             of an entity stay together); peak memory is independent of dataset size.
+//   Phase A: Rolling window stats via series_fir per entity+track
+//   Phase B: Per-segment PAA for ALL windows via series_fir (single mv-apply over paa_size)
+//   Phase C: Flatten + symbolize + aggregate to SCALARS per window (no dynamic-array payload)
+//   Phase D: Filter + distance + per-track top-k (inside the batch)
+//   Phase E: Reconstruct candidate_word for survivors only (join back to raw series)
+//   Phase F: Cross-track assembly with anchor buckets
+
+.create-or-alter function with (
+    folder = "SAX/Search",
+    docstring = "Find multivariate matches using per-track query-aware SAX, tolerance bands, elastic scaling, and bounded inter-track delay."
+) sax_similarity_search_multidim(
+    QueryTracks:(query_id:string, track_id:string, series:dynamic),
+    SearchTracks:(entity_id:string, track_id:string, series:dynamic),
+    query_length_symbols:int,
+    alphabet_size:int,
+    min_scale:real,
+    max_scale:real,
+    scale_steps:int,
+    symbol_tolerance:int,
+    max_inter_track_delay:int,
+    per_track_top_k:int,
+    top_k:int,
+    znorm_threshold:real)
+{
+    // --- Per-track query encoding (few tracks — UDF overhead negligible) ---
+    let alphabet = sax_alphabet(alphabet_size);
+    // Z-normalize each track (sax_znorm is row-safe — no toscalar). Breakpoints are
+    // NOT derived via sax_breakpoints_query here: that scalar UDF wraps a tabular
+    // expression with an internal toscalar(), so inlining it per-row over the
+    // QueryTracks parameter fails with CRT0018 ("can't use 'series' ... outside its
+    // row-context scope"). The 1-D search calls sax_breakpoints_query once in scalar
+    // context, where it is valid; the multidim path instead computes the identical
+    // nearest-rank quantile breakpoints inline with a TABULAR pattern (no toscalar),
+    // mirroring the row-safe inline approach used in sax_discords.
+    let QueryNormTracks =
+        materialize(
+            QueryTracks
+            | extend query_length = array_length(series)
+            | extend query_normalized = sax_znorm(series, znorm_threshold)
+            | project query_id, track_id, query_length, query_normalized
+        );
+    // Per-track nearest-rank quantile breakpoints (numerically identical to
+    // sax_breakpoints_query): sort the finite normalized values, then for each cut
+    // pick the value at rank floor(cut_index * n / alphabet_size). The first cut is
+    // the -infinity sentinel.
+    let QuerySortedValues =
+        QueryNormTracks
+        | mv-expand value = query_normalized to typeof(real)
+        | where isfinite(value)
+        | order by query_id asc, track_id asc, value asc
+        | summarize sorted_values = make_list(value) by query_id, track_id
+        | extend n = array_length(sorted_values);
+    let QueryBreakpoints =
+        QuerySortedValues
+        | mv-expand cut_index = range(0, alphabet_size - 1, 1) to typeof(long)
+        | extend value_rank = tolong(min_of(n - 1, max_of(0, floor(todouble(cut_index) * todouble(n) / todouble(alphabet_size), 1))))
+        | extend cut = iff(cut_index == 0, real(-1e308), todouble(sorted_values[value_rank]))
+        | order by query_id asc, track_id asc, cut_index asc
+        | summarize breakpoints = make_list(cut) by query_id, track_id
+        | extend bp_len = array_length(breakpoints);
+    let EncodedQueryTracks =
+        materialize(
+            QueryNormTracks
+            | join kind=inner QueryBreakpoints on query_id, track_id
+            | project query_id, track_id, query_length, breakpoints, bp_len, query_normalized
+        );
+    // Compute query PAA per track using integer binning
+    let QueryPaaPerTrack =
+        materialize(
+            EncodedQueryTracks
+            | mv-expand seg = range(0, query_length_symbols - 1, 1) to typeof(long)
+            | extend _qs = toint(floor(todouble(seg) * todouble(query_length) / todouble(query_length_symbols), 1))
+            | extend _qe = toint(floor(todouble(seg + 1) * todouble(query_length) / todouble(query_length_symbols), 1)) - 1
+            | extend _qe = max_of(_qs, _qe)
+            | extend _qslice = array_slice(query_normalized, _qs, _qe)
+            | extend paa_value = todouble(array_sum(_qslice)) / todouble(_qe - _qs + 1)
+            | extend symbol_index = toint(array_sum(series_greater_equals(repeat(paa_value, bp_len), breakpoints))) - 1
+            | extend symbol = tostring(alphabet[symbol_index])
+            | order by query_id asc, track_id asc, seg asc
+            | summarize query_paa = make_list(paa_value),
+                        query_word = strcat_array(make_list(symbol), ""),
+                        query_sym_indices = make_list(symbol_index),
+                        breakpoints = any(breakpoints),
+                        bp_len = any(bp_len)
+              by query_id, track_id, query_length
+        );
+    // required_track_count feeds the final "all query tracks matched" filter. It must NOT
+    // use toscalar(): QueryPaaPerTrack derives from the QueryTracks tabular parameter, and
+    // toscalar() over any parameter-derived expression fails with CRT0018 ("can't use
+    // 'series' as it is defined outside its row-context scope"), regardless of any
+    // intervening materialize/summarize. Compute it as a small per-query table instead and
+    // broadcast it into the final assembly via a lookup (see the RequiredTrackCounts join).
+    let RequiredTrackCounts =
+        materialize(
+            QueryPaaPerTrack
+            | summarize required_track_count = dcount(track_id) by query_id
+        );
+    // When min_scale == max_scale every step maps to the same window size, so collapse
+    // the sweep to a single evaluation instead of redundantly testing identical scales.
+    let effective_scale_steps = iff(min_scale == max_scale, 1, scale_steps);
+    let scale_denominator = iff(effective_scale_steps <= 1, real(1), todouble(effective_scale_steps - 1));
+    // --- Automatic memory batching (no user parameter) ---
+    // The QueryPaaPerTrack join, scale expansion, and length filter are applied BEFORE
+    // partitioning so the subquery references no external table; this enables the
+    // `native` strategy to stream many small partitions and bound peak memory.
+    // Hash by entity_id so ALL tracks of an entity stay in one batch (required for
+    // the per-track ranking done inside the batch and the cross-track assembly).
+    let Scaled =
+        SearchTracks
+        | join kind=inner QueryPaaPerTrack on track_id
+        | extend series_length = array_length(series)
+        | mv-expand scale_index = range(0, effective_scale_steps - 1, 1) to typeof(long)
+        | extend scale = iff(effective_scale_steps <= 1, min_scale, min_scale + (max_scale - min_scale) * todouble(scale_index) / scale_denominator)
+        | extend window_size = toint(max_of(1, round(todouble(query_length) * scale)))
+        | where series_length >= window_size
+        | extend _num_windows = series_length - window_size + 1;
+    let target_expand_rows = 2000000;
+    let windows_budget = max_of(tolong(1), tolong(target_expand_rows) / tolong(max_of(1, query_length_symbols)));
+    // Determine the number of memory batches from the total window count. toscalar()
+    // cannot be used here: `Scaled` derives from the `SearchTracks` tabular parameter's
+    // `series` column, and Kusto rejects toscalar() over any expression carrying a
+    // parameter-derived row context with "CRT0018: 'toscalar': can't use 'series' as it
+    // is defined outside its row-context scope" (materialize + project does NOT sever
+    // this lineage; only an aggregation does). Instead, compute num_buckets as a
+    // single-row table and broadcast it onto `Scaled` via a `lookup` (which broadcasts
+    // the tiny dimension table without shuffling `Scaled`) -- the documented mitigation
+    // for this limitation. The summarize collapses away `series`, so the tiny BucketPlan
+    // table is a plain scalar with no dynamic payload.
+    let BucketPlan =
+        materialize(
+            Scaled
+            | summarize total_windows = sum(_num_windows)
+            | extend num_buckets = tolong(max_of(tolong(1), (total_windows + windows_budget - tolong(1)) / windows_budget))
+            | extend _bcast_key = 1
+            | project _bcast_key, num_buckets
+        );
+    let Batched =
+        Scaled
+        | extend _bcast_key = 1
+        | lookup kind=inner BucketPlan on _bcast_key
+        | extend _batch = abs(hash(entity_id) % num_buckets)
+        | project-away _bcast_key, num_buckets;
+    // --- Phases A-D + per-track top-k run per batch (native partition; scalar-only payload) ---
+    let PerTrackSurvivors =
+        Batched
+        | partition hint.strategy=native by _batch (
+            // Phase A: rolling window statistics per entity+track
+            extend _fir_coeff = repeat(1.0, window_size)
+            | extend _rolling_mean = array_slice(series_fir(series, _fir_coeff, true, false), window_size - 1, series_length - 1)
+            | extend _rolling_meansq = array_slice(series_fir(series_multiply(series, series), _fir_coeff, true, false), window_size - 1, series_length - 1)
+            | extend _rolling_var = series_subtract(_rolling_meansq, series_multiply(_rolling_mean, _rolling_mean))
+            | extend _rolling_std = series_pow(series_abs(_rolling_var), repeat(0.5, _num_windows))
+            | extend _std_mask = series_greater_equals(_rolling_std, repeat(znorm_threshold, _num_windows))
+            | extend _safe_std = series_add(
+                series_multiply(_rolling_std, _std_mask),
+                series_subtract(repeat(1.0, _num_windows), _std_mask))
+            | project query_id, entity_id, track_id, series, window_size, scale_index, scale,
+                      _num_windows, _rolling_mean, _safe_std, query_paa, query_word, query_sym_indices, breakpoints, bp_len
+            // Phase B: per-segment PAA via series_fir; slim payload (one array + scalars).
+            | mv-apply seg_k = range(0, query_length_symbols - 1, 1) to typeof(long) on (
+                extend _seg_start = toint(floor(todouble(seg_k) * todouble(window_size) / todouble(query_length_symbols), 1))
+                | extend _seg_end = toint(floor(todouble(seg_k + 1) * todouble(window_size) / todouble(query_length_symbols), 1)) - 1
+                | extend _seg_end = max_of(_seg_start, _seg_end)
+                | extend _seg_len = _seg_end - _seg_start + 1
+                | extend _seg_fir_full = series_fir(series, repeat(1.0, _seg_len), true, false)
+                | extend _raw_seg_mean = array_slice(_seg_fir_full, _seg_end, _seg_end + _num_windows - 1)
+                | extend _paa_k = series_divide(series_subtract(_raw_seg_mean, _rolling_mean), _safe_std)
+                | extend _q_k = todouble(query_paa[toint(seg_k)])
+                | extend _q_sym_idx_k = toint(query_sym_indices[toint(seg_k)])
+                | project seg_k, _paa_k, _q_k, _q_sym_idx_k
+            )
+            | project-away series, _rolling_mean, _safe_std
+            // Phase C: flatten window dimension + symbolize + aggregate to SCALARS only.
+            | mv-expand with_itemindex=_win_idx _paa_val = _paa_k to typeof(real)
+            | extend _sym_idx = toint(array_sum(series_greater_equals(repeat(_paa_val, bp_len), breakpoints))) - 1
+            | extend _sym_dist = abs(_sym_idx - _q_sym_idx_k)
+            | extend _dsq_val = (_paa_val - _q_k) * (_paa_val - _q_k)
+            | summarize
+                max_symbol_dist = max(_sym_dist),
+                _total_dist_sq = sum(_dsq_val)
+              by query_id, entity_id, track_id, scale_index, scale, window_size, query_word, _win_idx
+            // Phase D: symbolic filter + distance
+            | where symbol_tolerance < 0 or max_symbol_dist <= symbol_tolerance
+            | extend start_index = tolong(_win_idx)
+            | extend end_index = start_index + tolong(window_size) - 1
+            | extend distance = sqrt(_total_dist_sq)
+            | extend similarity = 1.0 / (1.0 + distance)
+            | extend symbolic_distance = todouble(max_symbol_dist)
+            // Per-track top-k (each entity is fully contained in this batch)
+            | order by entity_id asc, track_id asc, similarity desc, distance asc, start_index asc
+            | extend track_partition = strcat(entity_id, "|", track_id)
+            | serialize
+            | extend track_rank = row_number(1, prev(track_partition) != track_partition)
+            | where track_rank <= per_track_top_k
+            | project query_id, entity_id, track_id, start_index, end_index, window_size,
+                      scale_index, scale, query_word, symbolic_distance, distance, similarity
+        );
+    // --- Phase E: reconstruct candidate_word for survivors ONLY (join back to raw series) ---
+    let ReconstructedTracks =
+        PerTrackSurvivors
+        | join kind=inner (SearchTracks | project entity_id, track_id, _full_series = series) on entity_id, track_id
+        | project-away entity_id1, track_id1
+        | join kind=inner (QueryPaaPerTrack | project query_id, track_id, breakpoints, bp_len) on query_id, track_id
+        | project-away query_id1, track_id1
+        | extend _win = array_slice(_full_series, start_index, end_index)
+        | extend _wmean = todouble(array_sum(_win)) / todouble(window_size)
+        | extend _wmeansq = todouble(array_sum(series_multiply(_win, _win))) / todouble(window_size)
+        | extend _wvar = _wmeansq - _wmean * _wmean
+        | extend _wstd = sqrt(abs(_wvar))
+        | extend _wsafe_std = iff(_wstd >= znorm_threshold, _wstd, 1.0)
+        | mv-apply seg_k = range(0, query_length_symbols - 1, 1) to typeof(long) on (
+            extend _seg_start = toint(floor(todouble(seg_k) * todouble(window_size) / todouble(query_length_symbols), 1))
+            | extend _seg_end = toint(floor(todouble(seg_k + 1) * todouble(window_size) / todouble(query_length_symbols), 1)) - 1
+            | extend _seg_end = max_of(_seg_start, _seg_end)
+            | extend _seg_slice = array_slice(_win, _seg_start, _seg_end)
+            | extend _raw_seg_mean = todouble(array_sum(_seg_slice)) / todouble(_seg_end - _seg_start + 1)
+            | extend _v = (_raw_seg_mean - _wmean) / _wsafe_std
+            | extend _sidx = toint(array_sum(series_greater_equals(repeat(_v, bp_len), breakpoints))) - 1
+            | extend _s = tostring(alphabet[_sidx])
+            | summarize candidate_word = strcat_array(make_list(_s), "")
+        )
+        | project query_id, entity_id, track_id, start_index, end_index, window_size,
+                  scale_index, scale, query_word, symbolic_distance, distance, similarity, candidate_word;
+    // --- Phase F: anchor bucket assembly (ranking already applied inside the batch) ---
+    let TrackCandidates =
+        ReconstructedTracks
+        | extend anchor_bucket_size = max_of(1, max_inter_track_delay + 1)
+        | extend anchor_bucket_base = bin(start_index, anchor_bucket_size)
+        | extend anchor_buckets = pack_array(anchor_bucket_base - anchor_bucket_size, anchor_bucket_base, anchor_bucket_base + anchor_bucket_size)
+        | mv-expand anchor_bucket = anchor_buckets to typeof(long)
+        // Keep only the single best window per track within each anchor bucket so the
+        // assembled match lists each track exactly once and its avg-based scores are
+        // not skewed by repeated per-track survivor windows.
+        | summarize arg_max(similarity, *) by query_id, entity_id, anchor_bucket, track_id;
+    // --- Cross-track assembly ---
+    TrackCandidates
+    | summarize
+        matched_track_count = dcount(track_id),
+        unified_start = min(start_index),
+        unified_end = max(end_index),
+        max_start = max(start_index),
+        min_start = min(start_index),
+        exact_score = avg(similarity),
+        mean_distance = avg(distance),
+        symbolic_score = 1.0 / (1.0 + avg(symbolic_distance)),
+        track_matches = make_list(bag_pack(
+            "track_id", track_id,
+            "start_index", start_index,
+            "end_index", end_index,
+            "scale", scale,
+            "query_word", query_word,
+            "candidate_word", candidate_word,
+            "symbolic_distance", symbolic_distance,
+            "distance", distance,
+            "similarity", similarity
+        )),
+        zipped_query = strcat_array(make_list(strcat(track_id, ":", query_word)), "|"),
+        zipped_candidate = strcat_array(make_list(strcat(track_id, ":", candidate_word)), "|")
+      by query_id, entity_id, anchor_bucket
+    | lookup kind=inner RequiredTrackCounts on query_id
+    | where matched_track_count == required_track_count
+    | where max_start - min_start <= max_inter_track_delay
+    | extend rank_score = exact_score * symbolic_score
+    | project query_id, entity_id, start_index = unified_start, end_index = unified_end,
+              matched_track_count, symbolic_score, exact_score, mean_distance, rank_score,
+              match_pattern = zipped_query, candidate_pattern = zipped_candidate,
+              track_matches,
+              explain = bag_pack("anchor_bucket", anchor_bucket, "max_inter_track_delay", max_inter_track_delay)
+    | summarize arg_max(rank_score, *) by query_id, entity_id, start_index, end_index
+    | order by rank_score desc, mean_distance asc, entity_id asc, start_index asc
+    | serialize rank = row_number()
+    | where rank <= top_k
+}

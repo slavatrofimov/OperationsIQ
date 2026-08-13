@@ -1,0 +1,24 @@
+# Example variables shared across the Azure Terraform modules.
+# Copy per-module (foundry / entra / deploy-sp) or pass with -var-file.
+# Never commit real ids/secrets.
+
+# --- Common ---
+subscription_id     = "00000000-0000-0000-0000-000000000000"
+location            = "eastus"
+resource_group_name = "rg-operations-iq"
+
+# --- foundry/ ---
+account_name  = "operations-iq-foundry"   # globally unique
+project_name  = "operations-iq"
+model_name    = "gpt-4o"
+model_sku     = "GlobalStandard"
+model_capacity = 20
+
+# --- entra/ ---
+display_name      = "Operations IQ Eventhouse SPA"
+redirect_origins  = ["http://localhost:5173", "https://<your-app>.webapp.fabricapps.net"]
+grant_admin_consent = true
+
+# --- deploy-sp/ (optional) ---
+# assign_azure_role = true
+# azure_role        = "Contributor"

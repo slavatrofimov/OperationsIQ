@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Authenticating…</title>
+  </head>
+  <body>
+    <!--
+      Dedicated MSAL redirect target. Intentionally empty: MSAL reads the auth
+      response from this page's URL hash during popup and silent-iframe token
+      flows. Keeping it lightweight (no app bootstrap) prevents the SPA from
+      reloading inside the hidden renewal iframe, which otherwise triggers the
+      MSAL `block_iframe_reload` error when the app is embedded in the Fabric
+      portal iframe.
+    -->
+  </body>
+</html>

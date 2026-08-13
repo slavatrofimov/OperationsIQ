@@ -1,0 +1,240 @@
+// SAX-guided discord discovery.
+
+.create-or-alter function with (
+    folder = "SAX/Discords",
+    docstring = "Discover time-series discords by scoring the candidate_limit rarest-SAX-word windows per series (a bounded, range-length-independent candidate set) with exact z-normalized PAA nearest-neighbor distances against all windows. When detection_window_bins > 0, candidates are confined to the most-recent detection_window_bins samples and scored against the preceding history only (novelty detection for alerting); detection_window_bins <= 0 scores the whole range."
+) sax_discords(
+    SeriesTable:(series_id:string, series:dynamic),
+    window_size:int,
+    num_discords:int,
+    paa_size:int,
+    alphabet_size:int,
+    znorm_threshold:real,
+    candidate_limit:int,
+    detection_window_bins:int = 0)
+{
+    let alphabet = sax_alphabet(alphabet_size);
+    // --- Memory-bounded window generation ---------------------------------
+    // Every sliding window must be z-normalised, PAA-reduced and symbolised.
+    // The naive form `mv-expand start_index = range(...) | extend window_series
+    // = array_slice(series, ...)` keeps the FULL series array alive on every
+    // one of the (series_length) expanded rows, so peak memory grows as
+    // series_length^2 -- a 86k-point series needs ~60 GB and aborts with a
+    // PARTIAL failure (E_LOW_MEMORY_CONDITION), surfaced by the service as an
+    // empty result ("no discords found") or, on longer ranges, an explicit
+    // low-memory error. Instead we expand the start indices in fixed-size
+    // BATCHES inside a `native` partition, so at most starts_per_batch windows
+    // (each carrying one slice of the series) are materialised at a time. Peak
+    // memory is now ~= starts_per_batch x series_length, independent of range.
+    let starts_per_batch = tolong(4000);
+    let Windows =
+        materialize(
+            SeriesTable
+            | extend series_length = array_length(series),
+                     breakpoints = sax_breakpoints_gaussian(alphabet_size)
+            | where series_length >= window_size
+            | extend _num_windows = series_length - window_size + 1
+            | extend _num_batches = tolong((_num_windows + starts_per_batch - 1) / starts_per_batch)
+            | mv-expand _wbatch = range(0, _num_batches - 1, 1) to typeof(long)
+            | partition hint.strategy=native by _wbatch (
+                extend _b0 = _wbatch * starts_per_batch
+                | extend _b1 = min_of(_b0 + starts_per_batch - 1, _num_windows - 1)
+                | mv-expand start_index = range(_b0, _b1, 1) to typeof(long)
+                | extend end_index = start_index + window_size - 1
+                | extend znormed = sax_znorm(array_slice(series, start_index, end_index), znorm_threshold)
+                // Integer-binned PAA + symbolization computed inline (row-safe). The
+                // scalar sax_paa / sax_symbolize_values helpers wrap a tabular
+                // expression that Kusto cannot evaluate in a per-row context
+                // (CRT0018: toscalar can't use a row column), so we use the same
+                // segment-wise vectorized pattern the search functions use.
+                | mv-apply seg_k = range(0, paa_size - 1, 1) to typeof(long) on (
+                    extend _seg_start = toint(floor(todouble(seg_k) * todouble(window_size) / todouble(paa_size), 1))
+                    | extend _seg_end = max_of(_seg_start, toint(floor(todouble(seg_k + 1) * todouble(window_size) / todouble(paa_size), 1)) - 1)
+                    | extend _seg_slice = array_slice(znormed, _seg_start, _seg_end)
+                    | extend _paa_v = todouble(array_sum(_seg_slice)) / todouble(_seg_end - _seg_start + 1)
+                    | extend _sym_idx = toint(array_sum(series_greater_equals(repeat(_paa_v, array_length(breakpoints)), breakpoints))) - 1
+                    | extend _sym = tostring(alphabet[_sym_idx])
+                    | summarize paa = make_list(_paa_v), word = strcat_array(make_list(_sym), "")
+                )
+                | project series_id, start_index, end_index, paa, word
+            )
+        );
+    let WordCounts =
+        Windows
+        | summarize word_frequency = count() by series_id, word;
+    // --- Detection-window bounds ------------------------------------------
+    // When detection_window_bins > 0, candidates are confined to the most-recent
+    // detection_window_bins samples and neighbours to the PRECEDING history, so a
+    // recent window is a discord only when its shape is unlike anything BEFORE it
+    // (novelty detection for alerting). This also naturally bounds the candidate
+    // count by the (small) detection window instead of the range. app_search_space
+    // gap-fills every series onto the same [start,end] grid, so a single scalar
+    // length is exact; the candidate/neighbour filters below are no-ops when
+    // detection_window_bins <= 0 (original whole-range behaviour).
+    let _series_length = toscalar(Windows | summarize max(end_index)) + 1;
+    let _detection_start = tolong(_series_length - detection_window_bins);
+    let WindowsFreq =
+        materialize(
+            Windows
+            | join kind=inner WordCounts on series_id, word
+            | project series_id, start_index, end_index, paa, word, word_frequency
+        );
+    // Candidate selection by SAX-word RARITY, capped to a bounded count.
+    //
+    // A discord is, by definition, a window whose shape recurs rarely, so its
+    // SAX word has a LOW frequency; a window with a HIGH word_frequency has many
+    // near-duplicates and therefore a tiny nearest-neighbour distance -- it can
+    // never be a discord and is skipped.
+    //
+    //   candidate_limit  > 0 : score the candidate_limit RAREST windows per
+    //                          series -- fewest-frequency SAX words first, ties
+    //                          broken by start_index so the kept windows stay
+    //                          spread across the range. This is a RARITY rank,
+    //                          not a positional cap, so anomalies late in the
+    //                          range are still found. Crucially the candidate
+    //                          count is now BOUNDED by candidate_limit regardless
+    //                          of how long the range is.
+    //   candidate_limit <= 0 : "auto / thorough" -- keep every window no more
+    //                          common than its series' average word_frequency
+    //                          (prunes only the impossible-discord common bulk).
+    //
+    // Why the cap matters: the nearest-neighbour scoring below is intrinsically
+    // O(candidate_count x window_count) in the PAA rows it must materialise. The
+    // previous selection was a FREQUENCY THRESHOLD ("keep every window at or
+    // below the Nth-smallest frequency"), which on smooth/trending signals keeps
+    // ~40-50% of ALL windows -- so candidate_count grew with the range and the
+    // scoring join exhausted the query memory budget. Kusto then aborts with a
+    // PARTIAL failure (E_LOW_MEMORY_CONDITION / bad allocation) that the service
+    // returns as an EMPTY result, which the UI reports as "no discords found"
+    // (and, on longer ranges, as an explicit low-memory error). Bounding the
+    // candidate count keeps peak scoring memory ~= candidate_limit x window_count
+    // instead of ~= window_count^2.
+    let FreqMeanCut =
+        WindowsFreq
+        | summarize _cut_mean = avg(todouble(word_frequency)) by series_id;
+    let OrderedCandidates =
+        materialize(
+            WindowsFreq
+            // Confine candidates to the most-recent detection window (if enabled)
+            // BEFORE the rarity rank, so candidate_limit keeps the rarest windows
+            // WITHIN the recent window rather than across the whole range.
+            | where detection_window_bins <= 0 or start_index >= _detection_start
+            | order by series_id asc, word_frequency asc, start_index asc
+            | serialize _rarity_rank = row_number(1, series_id != prev(series_id))
+            | join kind=leftouter FreqMeanCut on series_id
+            | where iff(candidate_limit > 0,
+                        _rarity_rank <= candidate_limit,
+                        todouble(word_frequency) <= _cut_mean)
+            | project series_id, start_index, end_index, paa, word, word_frequency
+        );
+    // --- Memory-bounded nearest-neighbour scoring -------------------------
+    // Scoring is intrinsically O(candidate_count x window_count): every
+    // candidate must find its nearest non-overlapping neighbour among all
+    // windows. Two mechanisms keep peak memory in check:
+    //   * The candidate set is CAPPED above (candidate_limit rarest windows per
+    //     series), so candidate_count no longer grows with the range length --
+    //     a discord's SAX word is rare, so a common (high word_frequency) window
+    //     can never be a discord and is never scored.
+    //   * We exploit the fact that candidate_count is BOUNDED (<= candidate_limit
+    //     per series) but window_count is not. Rather than joining the full
+    //     neighbour list onto each candidate (which materialises a
+    //     candidate x window product and, at 86k windows, allocates GBs before
+    //     the partition can split it), we BROADCAST the small candidate set as a
+    //     scalar and PARTITION THE WINDOWS: each batch of windows is scored
+    //     against every candidate, then per-batch nearest neighbours are folded
+    //     into a global minimum per candidate. Peak memory is one window batch's
+    //     expansion (~ target_expand_rows), never the whole product, and the
+    //     giant neighbour list is never replicated.
+    //
+    // NOTE on packing: each candidate is packed into a property BAG. make_list()
+    // FLATTENS dynamic-array values (make_list([1,2]) over two rows yields
+    // [1,2,3,4], not [[1,2],[3,4]]), so make_list(paa) over the candidates would
+    // concatenate every PAA into one flat scalar list; the per-candidate PAA
+    // would then expand as a scalar, series_subtract(paa, scalar) would be null,
+    // and the isfinite filter would drop ALL rows -- i.e. "no discords found" on
+    // every real run. Wrapping each candidate in a bag keeps its PAA array intact
+    // through make_list / mv-expand.
+    let Candidates =
+        toscalar(OrderedCandidates
+            | summarize make_list(bag_pack(
+                "sid", series_id, "s", start_index, "e", end_index,
+                "p", paa, "w", word, "wf", word_frequency)));
+    let candidate_count = toscalar(OrderedCandidates | count);
+    let window_count = toscalar(Windows | count);
+    // Batch sizing: keep each window batch's expanded (window x candidate) row
+    // count near target_expand_rows so no single step blows past the budget.
+    let target_expand_rows = tolong(2000000);
+    let win_buckets =
+        max_of(tolong(1),
+               (tolong(window_count) * max_of(tolong(1), tolong(candidate_count)) + target_expand_rows - tolong(1))
+               / target_expand_rows);
+    let Scored =
+        Windows
+        // Neighbours = the baseline. In detection mode this is HISTORY ONLY (windows
+        // before the detection window), so a recent window is scored purely against
+        // the past; this avoids twin-anomaly masking (a persistent anomaly's adjacent
+        // recent windows would otherwise be each other's nearest neighbour).
+        | where detection_window_bins <= 0 or start_index < _detection_start
+        | extend _wbucket = tolong(abs(hash(start_index) % win_buckets))
+        | partition hint.strategy=native by _wbucket (
+            // Each window in this batch is a potential NEIGHBOUR; compare it to
+            // every (same-series) candidate via the broadcast scalar. Bag packing
+            // keeps each candidate PAA array intact through mv-expand.
+            extend _cands = Candidates
+            | mv-expand cand = _cands to typeof(dynamic)
+            | where tostring(cand["sid"]) == series_id
+            | extend cand_start = tolong(cand["s"])
+            | where abs(cand_start - start_index) >= window_size
+            // Inline sax_euclidean_arrays: sqrt(sum((cand_paa - neighbour_paa)^2)).
+            | extend _diff = series_subtract(todynamic(cand["p"]), paa)
+            | extend distance = sqrt(array_sum(series_multiply(_diff, _diff)))
+            // Drop non-finite distances so a single degenerate neighbour (e.g. a
+            // window spanning a gap-filled / flat region whose PAA carries a NaN)
+            // cannot poison arg_min/min and surface NaN "discords" instead of real
+            // anomalies.
+            | where isfinite(distance)
+            // Best neighbour for each candidate WITHIN this window batch.
+            | summarize arg_min(distance, start_index),
+                        cand_end = any(tolong(cand["e"])),
+                        cand_word = any(tostring(cand["w"])),
+                        cand_wf = any(tolong(cand["wf"]))
+              by series_id, cand_start
+        )
+        // Fold per-batch nearest neighbours into a global minimum per candidate.
+        | summarize arg_min(distance, start_index),
+                    cand_end = any(cand_end), cand_word = any(cand_word), cand_wf = any(cand_wf)
+          by series_id, cand_start
+        | where isfinite(distance)
+        | project series_id, start_index = cand_start, end_index = cand_end,
+                  nearest_neighbor_start = start_index, nn_distance = distance,
+                  word = cand_word, word_frequency = cand_wf;
+    Scored
+    | order by series_id asc, nn_distance desc, start_index asc
+    | scan declare (selected_series:string = "", selected_starts:dynamic = dynamic([]), keep:bool = false) with
+    (
+        step s: true =>
+            selected_series = series_id,
+            keep = iff(
+                series_id != s.selected_series,
+                true,
+                array_length(set_intersect(s.selected_starts, range(start_index - window_size + 1, start_index + window_size - 1, 1))) == 0
+            ),
+            selected_starts = iff(
+                series_id != s.selected_series,
+                pack_array(start_index),
+                iff(
+                    array_length(set_intersect(s.selected_starts, range(start_index - window_size + 1, start_index + window_size - 1, 1))) == 0,
+                    array_concat(s.selected_starts, pack_array(start_index)),
+                    s.selected_starts
+                )
+            )
+            ;
+    )
+    | where keep
+    | order by nn_distance desc, series_id asc, start_index asc
+    | serialize rank = row_number()
+    | where rank <= num_discords
+    | project series_id, start_index, end_index, nearest_neighbor_start,
+              nn_distance, word, word_frequency, rank,
+              explain = bag_pack("window_size", window_size, "paa_size", paa_size, "alphabet_size", alphabet_size)
+}

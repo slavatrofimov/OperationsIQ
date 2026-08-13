@@ -1,0 +1,11 @@
+{
+  "executableFile": "pattern_analysis.py",
+  "defaultLakehouseArtifactId": "",
+  "mainClass": "",
+  "additionalLakehouseIds": [],
+  "retryPolicy": null,
+  "commandLineArguments": "",
+  "additionalLibraryUris": [],
+  "language": "Python",
+  "environmentArtifactId": null
+}

@@ -1,0 +1,5 @@
+# Fabric-item deployment driver dependencies.
+# Install with:  python -m pip install -r deploy/fabric/requirements.txt
+fabric-cicd>=0.1.20
+azure-identity>=1.17.0
+requests>=2.31.0

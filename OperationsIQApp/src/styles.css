@@ -1,0 +1,26 @@
+:root {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* Reserve space for the vertical scrollbar at all times so content width does
+ * not shift when it appears/disappears — a common source of layout "jitter"
+ * when pages grow/shrink at certain window sizes (e.g. the Root cause page). */
+html {
+  scrollbar-gutter: stable;
+}
+
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: #faf9f8;
+}

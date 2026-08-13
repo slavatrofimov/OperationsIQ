@@ -1,0 +1,5 @@
+{
+  "displayName": "Operations IQ",
+  "capacityId": "fea674b2-48af-4853-99f2-e4a79c8bbcc1",
+  "description": "Backend for the Operations IQ app (Eventhouse + operational signal analytics functions)."
+}

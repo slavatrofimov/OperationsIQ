@@ -1,0 +1,358 @@
+// ============================================================================
+// Bounded historical spectral aggregation
+// ----------------------------------------------------------------------------
+// PURPOSE
+//   Compares each track's latest detection_window magnitude spectrum with a
+//   centroid built from immediately preceding, equal-length FFT windows.
+//
+// INTERPRETATION
+//   The detector returns one latest-window row per entity. event_time/window_end
+//   equal the exclusive prepared-series end; window_start is exactly one
+//   detection_window earlier. Magnitudes discard phase and emphasize changes in
+//   spectral shape.
+//
+// BEST FIT / LIMITS
+//   Useful for vibration, rotating equipment, cyclic processes, and traffic
+//   periodicity. Requires at least 32 regular bins; power-of-two window sizes are
+//   preferred. It can miss pure phase shifts and can react broadly to impulses.
+//
+// MEMORY BOUND
+//   baseline_window_count is capped at 128. Windows are non-overlapping and only
+//   DC-through-Nyquist magnitudes are expanded. An internal five-million-row
+//   frequency-work guard returns work_limit_exceeded before FFT expansion.
+//   Frequency and track contributors are reconstructed only for anomaly rows.
+//
+// EXAMPLE
+//   mvad_spectral_aggregation(
+//       SeriesTable, 64m, 8, 3, true, 2.0, 1.5, 2, 0.5, 4.0, false)
+// ============================================================================
+
+.create-or-alter function with (
+    folder = "MVAD/Detectors",
+    docstring = "Detect latest-window spectral-shape anomalies against a bounded ensemble of historical equal-length FFT windows."
+) mvad_spectral_aggregation(
+    SeriesTable:(
+        entity_id:string,
+        track_id:string,
+        series:dynamic,
+        series_start:datetime,
+        series_end:datetime,
+        bin_size:timespan,
+        point_count:long,
+        observed_bins:long,
+        coverage:real,
+        max_missing_run:long,
+        is_valid:bool,
+        validation_error:string
+    ),
+    detection_window:timespan,
+    baseline_window_count:int,
+    min_baseline_windows:int,
+    use_hann_window:bool,
+    track_score_threshold:real,
+    spectral_rms_threshold:real,
+    min_track_votes:int,
+    min_vote_fraction:real,
+    extreme_track_threshold:real,
+    emit_all_scores:bool)
+{
+    let _parameters_are_valid = assert(
+        detection_window > 0s
+            and baseline_window_count >= 2
+            and baseline_window_count <= 128
+            and min_baseline_windows >= 2
+            and min_baseline_windows <= baseline_window_count
+            and track_score_threshold > 0.0
+            and spectral_rms_threshold > 0.0
+            and min_track_votes >= 1
+            and min_vote_fraction > 0.0
+            and min_vote_fraction <= 1.0
+            and extreme_track_threshold > 0.0,
+        "mvad_spectral_aggregation: invalid detection-window, baseline-window, threshold, or vote parameter."
+    );
+    let _validated_series = SeriesTable | where _parameters_are_valid;
+    let _base_profiles =
+        materialize(
+            mvad_entity_profile(
+                _validated_series,
+                detection_window,
+                1
+            )
+        );
+    let _profiles =
+        materialize(
+            _base_profiles
+            | extend
+                _available_baseline_windows = iff(
+                    detection_bins > 0,
+                    (point_count - detection_bins) / detection_bins,
+                    tolong(0)
+                )
+            | extend _baseline_windows =
+                min_of(tolong(baseline_window_count), _available_baseline_windows)
+            | extend _frequency_bins = detection_bins / 2
+            | extend _estimated_frequency_rows =
+                track_count * (_baseline_windows + 1) * _frequency_bins
+            | extend
+                detail = case(
+                    status != "ok", detail,
+                    detection_bins < 32, "The spectral detection window must contain at least 32 bins.",
+                    _available_baseline_windows < min_baseline_windows,
+                        strcat("Need at least ", min_baseline_windows, " complete historical FFT windows."),
+                    _estimated_frequency_rows > tolong(5000000),
+                        strcat("Estimated frequency expansion ", _estimated_frequency_rows, " exceeds the internal 5,000,000-row guard."),
+                    ""
+                ),
+                status = case(
+                    status != "ok", status,
+                    detection_bins < 32, "insufficient_history",
+                    _available_baseline_windows < min_baseline_windows, "insufficient_history",
+                    _estimated_frequency_rows > tolong(5000000), "work_limit_exceeded",
+                    "ok"
+                )
+            | project
+                entity_id, series_start, series_end, bin_size, point_count,
+                detection_bins, track_count, valid_track_count,
+                invalid_track_count, status, detail, _baseline_windows
+        );
+    let _frames =
+        materialize(
+            SeriesTable
+            | join kind=inner (
+                _profiles
+                | where status == "ok"
+                | project
+                    entity_id,
+                    _profile_start = series_start,
+                    _profile_end = series_end,
+                    _profile_bin = bin_size,
+                    _profile_points = point_count,
+                    _fft_window_bins = detection_bins,
+                    _profile_track_count = track_count,
+                    _baseline_windows
+            ) on entity_id
+            // Ordinal zero is latest; 1..N are the immediately preceding
+            // non-overlapping historical windows.
+            | mv-expand _window_ordinal = range(0, _baseline_windows, 1) to typeof(long)
+            | extend
+                _frame_start = _profile_points - (tolong(_window_ordinal) + 1) * _fft_window_bins,
+                _frame_end = _profile_points - tolong(_window_ordinal) * _fft_window_bins - 1
+            | extend _frame = array_slice(series, _frame_start, _frame_end)
+            | extend _standardized_frame =
+                mvad_standardize_from_history(_frame, 0, 1e-9)
+            | mv-apply _sample_index = range(0, _fft_window_bins - 1, 1) to typeof(long) on (
+                extend
+                    _sample = todouble(_standardized_frame[toint(_sample_index)]),
+                    _hann_weight = iff(
+                        use_hann_window,
+                        0.5 - 0.5 * cos(2.0 * pi() * todouble(_sample_index) / todouble(_fft_window_bins - 1)),
+                        1.0
+                    )
+                | order by _sample_index asc
+                | summarize _windowed_frame = make_list(_sample * _hann_weight)
+            )
+            | project
+                entity_id,
+                track_id,
+                _window_ordinal = tolong(_window_ordinal),
+                _windowed_frame,
+                _fft_window_bins,
+                series_start = _profile_start,
+                series_end = _profile_end,
+                bin_size = _profile_bin,
+                point_count = _profile_points,
+                track_count = _profile_track_count,
+                _baseline_windows
+        );
+    let _spectra =
+        materialize(
+            _frames
+            | extend (_fft_real, _fft_imaginary) = series_fft(_windowed_frame)
+            | extend _magnitude = series_pow(
+                series_add(
+                    series_multiply(_fft_real, _fft_real),
+                    series_multiply(_fft_imaginary, _fft_imaginary)
+                ),
+                repeat(0.5, _fft_window_bins)
+            )
+            // Drop DC (bin 0) and the mirrored upper half. Keep Nyquist for even
+            // windows; its imaginary magnitude is zero but it is a unique bin.
+            | extend _half_spectrum =
+                array_slice(_magnitude, 1, toint(_fft_window_bins / 2))
+            | mv-expand with_itemindex=_frequency_offset _magnitude_value = _half_spectrum to typeof(real)
+            | extend
+                frequency_bin = tolong(_frequency_offset) + 1,
+                magnitude = todouble(_magnitude_value)
+            | where isfinite(magnitude)
+            | project
+                entity_id, track_id, _window_ordinal, frequency_bin, magnitude,
+                _fft_window_bins, series_start, series_end, bin_size,
+                point_count, track_count, _baseline_windows
+        );
+    let _centroids =
+        materialize(
+            _spectra
+            | where _window_ordinal > 0
+            | summarize centroid_magnitude = avg(magnitude)
+              by entity_id, track_id, frequency_bin
+        );
+    let _distance_components =
+        materialize(
+            _spectra
+            | join kind=inner _centroids on entity_id, track_id, frequency_bin
+            | extend
+                _dot = magnitude * centroid_magnitude,
+                _window_sq = magnitude * magnitude,
+                _centroid_sq = centroid_magnitude * centroid_magnitude
+            | summarize
+                _dot = sum(_dot),
+                _window_norm = sqrt(sum(_window_sq)),
+                _centroid_norm = sqrt(sum(_centroid_sq)),
+                series_start = any(series_start),
+                series_end = any(series_end),
+                bin_size = any(bin_size),
+                point_count = any(point_count),
+                track_count = any(track_count),
+                _baseline_windows = any(_baseline_windows)
+              by entity_id, track_id, _window_ordinal
+            | extend cosine_distance = case(
+                _window_norm <= 1e-12 and _centroid_norm <= 1e-12, 0.0,
+                _window_norm <= 1e-12 or _centroid_norm <= 1e-12, 1.0,
+                1.0 - _dot / (_window_norm * _centroid_norm)
+            )
+        );
+    let _historical_distance_stats =
+        _distance_components
+        | where _window_ordinal > 0
+        | summarize
+            _distance_p25 = percentile(cosine_distance, 25),
+            _distance_p50 = percentile(cosine_distance, 50),
+            _distance_p75 = percentile(cosine_distance, 75),
+            _baseline_distance_count = count()
+          by entity_id, track_id;
+    let _track_evidence =
+        materialize(
+            _distance_components
+            | where _window_ordinal == 0
+            | join kind=inner _historical_distance_stats on entity_id, track_id
+            | extend
+                _robust_spread = max_of(
+                    (_distance_p75 - _distance_p25) / 1.349,
+                    1e-6
+                )
+            | extend track_score =
+                max_of(0.0, (cosine_distance - _distance_p50) / _robust_spread)
+            | project
+                entity_id, track_id, track_score, cosine_distance,
+                _distance_p25, _distance_p50, _distance_p75,
+                _baseline_distance_count, series_start, series_end,
+                bin_size, point_count, track_count, _baseline_windows
+        );
+    let _scores =
+        materialize(
+            _track_evidence
+            | summarize
+                _sum_score_squared = sum(track_score * track_score),
+                _max_track_score = max(track_score),
+                vote_count = countif(track_score >= track_score_threshold),
+                series_start = any(series_start),
+                series_end = any(series_end),
+                bin_size = any(bin_size),
+                point_count = any(point_count),
+                track_count = any(track_count),
+                _baseline_windows = any(_baseline_windows)
+              by entity_id
+            | extend
+                score = sqrt(_sum_score_squared / todouble(track_count)),
+                vote_count = tolong(vote_count),
+                vote_fraction = todouble(vote_count) / todouble(track_count),
+                _required_votes = tolong(max_of(
+                    min_track_votes,
+                    ceiling(min_vote_fraction * todouble(track_count))
+                ))
+            | extend is_anomaly =
+                score >= spectral_rms_threshold
+                or vote_count >= _required_votes
+                or _max_track_score >= extreme_track_threshold
+            | extend severity = max_of(
+                score / spectral_rms_threshold,
+                todouble(vote_count) / todouble(_required_votes),
+                _max_track_score / extreme_track_threshold
+            )
+            | where emit_all_scores or is_anomaly
+        );
+    let _anomaly_keys =
+        _scores
+        | where is_anomaly
+        | project entity_id;
+    let _top_frequencies =
+        _spectra
+        | where _window_ordinal == 0
+        | join kind=inner _anomaly_keys on entity_id
+        | join kind=inner _centroids on entity_id, track_id, frequency_bin
+        | extend _relative_change =
+            abs(magnitude - centroid_magnitude) / max_of(abs(centroid_magnitude), 1e-9)
+        | order by entity_id asc, track_id asc, _relative_change desc
+        | serialize _group = strcat(entity_id, "|", track_id)
+        | extend _rank = row_number(1, _group != prev(_group))
+        | where _rank <= 3
+        | summarize changed_frequencies = make_list(bag_pack(
+            "frequency_bin", frequency_bin,
+            "latest_magnitude", magnitude,
+            "baseline_centroid_magnitude", centroid_magnitude,
+            "relative_change", _relative_change
+        )) by entity_id, track_id;
+    let _contributors =
+        _track_evidence
+        | join kind=inner _anomaly_keys on entity_id
+        | join kind=leftouter _top_frequencies on entity_id, track_id
+        | order by entity_id asc, track_score desc
+        | serialize
+        | extend _rank = row_number(1, entity_id != prev(entity_id))
+        | where _rank <= 5
+        | summarize contributors = make_list(bag_pack(
+            "track_id", track_id,
+            "track_score", track_score,
+            "latest_cosine_distance", cosine_distance,
+            "historical_distance_median", _distance_p50,
+            "historical_distance_p25", _distance_p25,
+            "historical_distance_p75", _distance_p75,
+            "changed_frequencies", coalesce(changed_frequencies, dynamic([]))
+        )) by entity_id;
+    let _results =
+        _scores
+        | join kind=leftouter _contributors on entity_id
+        | project
+            entity_id,
+            algorithm = "spectral_aggregation",
+            event_index = point_count - 1,
+            event_time = series_end,
+            window_start = series_end - detection_window,
+            window_end = series_end,
+            score,
+            threshold = spectral_rms_threshold,
+            severity,
+            is_anomaly,
+            vote_count,
+            vote_fraction,
+            track_count,
+            contributors = coalesce(contributors, dynamic([])),
+            status = "ok",
+            explain = bag_pack(
+                "fft_window_bins", tolong(detection_window / bin_size),
+                "baseline_windows", _baseline_windows,
+                "hann_window", use_hann_window,
+                "track_score_threshold", track_score_threshold,
+                "required_votes", _required_votes,
+                "maximum_track_score", _max_track_score
+            );
+    let _diagnostic_profiles =
+        _profiles
+        | project
+            entity_id, series_start, series_end, bin_size, point_count,
+            detection_bins, track_count, valid_track_count,
+            invalid_track_count, status, detail;
+    let _diagnostics =
+        mvad_diagnostic_results(_diagnostic_profiles, "spectral_aggregation");
+    union _results, _diagnostics
+}

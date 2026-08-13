@@ -1,0 +1,51 @@
+// ============================================================================
+// Operations IQ app - analytics helper functions
+// ----------------------------------------------------------------------------
+// Deploy AFTER 00_tables.kql / 10_app_functions.kql. These stored functions push
+// descriptive-statistics and element-wise series transforms that used to run in
+// the browser down into KQL, so the results become first-class server-side series
+// that the app, Activator alerts and the agent can all reuse.
+//
+// Every function takes the canonical (SignalId, Timestamp, Value) shape as a
+// TABULAR PARAMETER named `Source` (see schema/10_app_functions.kql), so callers
+// bind their connection profile's timeseries query onto a `let Timeseries = (…)`
+// and pass it in.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// app_signal_profile: descriptive profile of a single signal over a range,
+// binned + gap-filled the same way the exploration timeline is. Powers the
+// SignalMetadata "suggest from data" helper (operating envelope = mean ± 3σ,
+// observed physical range, max rate-of-change) without pulling the raw series to
+// the browser.
+//
+// Returns one row: SignalId, Count (finite bins), Min, Max, Mean, Stdev (sample,
+// n-1), MaxAbsStep (largest |Δ| between consecutive bins) and MaxRatePerMin
+// (MaxAbsStep normalised to per-minute, floored at a 1-second bin like the client).
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "OperationsIQ/Analytics", docstring = "Descriptive profile (count/min/max/mean/stdev/max rate) for one signal over a range. Powers the metadata 'suggest from data' envelope. Source is a canonical (SignalId, Timestamp, Value) tabular argument.")
+app_signal_profile(Source: (SignalId: string, Timestamp: datetime, Value: real), tag: string, range_start: datetime, range_end: datetime, bin: timespan) {
+    let binMinutes = max_of(todouble(bin) / todouble(1m), 1.0 / 60.0);
+    let Profiled = Source
+        | where SignalId == tag
+        | where Timestamp between (range_start .. range_end)
+        | make-series series = avg(Value) default = real(null)
+            on Timestamp from range_start to range_end step bin
+        | extend series = series_fill_linear(series)
+        | extend _n = array_length(series)
+        | extend _diffs = series_abs(series_subtract(array_slice(series, 1, _n - 1), array_slice(series, 0, _n - 2)))
+        | extend MaxAbsStep = todouble(series_stats_dynamic(_diffs).max);
+    Profiled
+    | mv-apply x = series to typeof(real) on (
+        summarize _cnt = countif(isfinite(x)), _min = min(x), _max = max(x), _mean = avg(x), _sd = stdev(x)
+      )
+    | project
+        SignalId = tag,
+        Count = _cnt,
+        Min = _min,
+        Max = _max,
+        Mean = _mean,
+        Stdev = _sd,
+        MaxAbsStep = coalesce(MaxAbsStep, 0.0),
+        MaxRatePerMin = coalesce(MaxAbsStep, 0.0) / binMinutes
+}

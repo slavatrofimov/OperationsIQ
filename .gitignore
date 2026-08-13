@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Python virtual environments (created by scripts/bootstrap.mjs for spark/)
+.venv/
+
+# Python editable-install / build metadata
+*.egg-info/
+__pycache__/
+
+# Build output
+dist/
+build/
+.temp/
+
+# Local env (never commit real IDs/keys)
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.log
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Rayfin CLI compiled schema output
+**/rayfin/.temp/
+
+# Rayfin per-environment deployment state (machine/environment specific)
+**/rayfin/.deployments.json
+
+# Excluded subprojects (tracked in their own repositories)
+/References/
+/Time-Series-Visualization-with-Microsoft-Fabric/

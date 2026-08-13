@@ -1,0 +1,12 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "Eventhouse",
+    "displayName": "OperationsIQ",
+    "description": "Operations IQ Eventhouse — hosts the seeded sample KQL database (demo/trial)."
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "72f81e5b-5078-42a2-8178-80f876b2a6e5"
+  }
+}

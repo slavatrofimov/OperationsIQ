@@ -1,0 +1,69 @@
+// ============================================================================
+// Operations IQ app - Eventhouse schema (tables)
+// ----------------------------------------------------------------------------
+// Deploy order: run this file first, then 10_app_functions.kql, the SAX
+// function library (schema/30-70_sax_*.kql), the MVAD library in dependency
+// order (schema/80_mvad_core.kql then schema/81-84_mvad_*.kql), and finally
+// optional sample data.
+//
+// All commands are idempotent (.create-merge only appends missing columns and
+// never drops data), so this file is safe to re-run.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Timeseries: the raw long/narrow signal store. One row per tag per timestamp.
+// This is the fact table that every interface reads from.
+// ---------------------------------------------------------------------------
+.create-merge table Timeseries (
+    TagId: string,
+    Timestamp: datetime,
+    Value: real
+) with (docstring = "Raw long/narrow time-series values. One row per tag per timestamp.", folder = "OperationsIQ/Data")
+
+// ---------------------------------------------------------------------------
+// TagMetadata: display + semantic metadata for each tag/signal.
+// ---------------------------------------------------------------------------
+.create-merge table TagMetadata (
+    TagId: string,
+    TagName: string,
+    Metric: string,
+    Description: string,
+    EngUnits: string
+) with (docstring = "Display and semantic metadata for each tag (name, metric, units, description).", folder = "OperationsIQ/Data")
+
+// ---------------------------------------------------------------------------
+// TagHierarchy: physical/organizational placement of each tag. Drives the
+// hierarchical tag browser in the UI (Plant > Factory > Line > Station).
+// ---------------------------------------------------------------------------
+.create-merge table TagHierarchy (
+    TagId: string,
+    Plant: string,
+    Factory: string,
+    Line: string,
+    Station: string
+) with (docstring = "Physical/organizational placement of each tag (Plant > Factory > Line > Station).", folder = "OperationsIQ/Data")
+
+// ---------------------------------------------------------------------------
+// Events: time markers rendered on the exploration timeline (maintenance,
+// interventions, incidents, annotations sourced from operational systems).
+// ScopeType/ScopeId let an event target either a single tag ("TagId") or a
+// hierarchy node at a generic level ("Level1" .. "LevelN"). ScopeId stores
+// the tag id for TagId scopes, or the full '/'-joined hierarchy path through
+// that level (e.g. "Plant/Factory/Line") for LevelK scopes — level names are
+// not unique across different parents, so matching is on the full path, not
+// a single segment. Each path segment is percent-escaped ("%" -> "%25", "/"
+// -> "%2F") before joining, so a level value that itself contains "/" or "%"
+// can't be mistaken for a path boundary. A tag is in scope when its own path
+// at that level equals the scope's path. EndTimestamp is null for point
+// events and set for spans.
+// ---------------------------------------------------------------------------
+.create-merge table Events (
+    EventId: string,
+    ScopeType: string,
+    ScopeId: string,
+    Timestamp: datetime,
+    EndTimestamp: datetime,
+    EventType: string,
+    Title: string,
+    Detail: string
+) with (docstring = "Time-marker events (maintenance, incidents, interventions) scoped to a tag or hierarchy node.", folder = "OperationsIQ/Data")

@@ -1,0 +1,8 @@
+{
+  "label": "Diagnose",
+  "position": 4,
+  "link": {
+    "type": "doc",
+    "id": "diagnose/index"
+  }
+}

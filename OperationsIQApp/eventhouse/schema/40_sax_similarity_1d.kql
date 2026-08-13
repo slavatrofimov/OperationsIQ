@@ -1,0 +1,274 @@
+// Query-aware single-dimensional SAX similarity search.
+// Two distance engines share one query encoding, batching, and reconstruction:
+//   Fast path (symbol_tolerance <= 0): fully vectorized convolution distance.
+//     Computes the exact PAA distance for EVERY window from a few series_fir
+//     convolutions (T1=sum a_k, T2=sum a_k^2, T3=sum q_k a_k) via the identity
+//     dist^2 = (1/s^2)[T2 - 2 mu T1 + P mu^2] - (2/s)[T3 - mu Sq] + Sqq. Only the
+//     1-D distance array is expanded, so there is NO paa_size x num_windows blowup.
+//   Symbolic path (symbol_tolerance > 0): per-segment SAX symbols enable the
+//     symbol-distance tolerance pre-filter (Phases A-D below).
+// Shared stages:
+//   Batching: hash (series_id, scale_index) into native partitions sized to a fixed
+//             expand budget, so peak memory is independent of total dataset size.
+//   Phase A: Rolling window stats via series_fir
+//   Phase B: Per-segment PAA for ALL windows via series_fir (symbolic path only)
+//   Phase C: Flatten + symbolize + aggregate to SCALARS per window (symbolic path only)
+//   Phase D: Filter + distance + per-batch top-k
+//   Phase E: Reconstruct candidate_paa/word (and backfill symbolic_distance for the
+//            fast path) for global top-k survivors only (join back to raw)
+
+.create-or-alter function with (
+    folder = "SAX/Search",
+    docstring = "Find 1-D time-series subsequences similar to a query using query-fitted SAX and exact PAA-distance rescoring."
+) sax_similarity_search_1d(
+    Query:(query_id:string, series:dynamic),
+    SearchSpace:(series_id:string, series:dynamic),
+    query_length_symbols:int,
+    alphabet_size:int,
+    min_scale:real,
+    max_scale:real,
+    scale_steps:int,
+    symbol_tolerance:int,
+    top_k:int,
+    znorm_threshold:real)
+{
+    // --- Query encoding (single query — UDF overhead negligible) ---
+    let query_id_val = toscalar(Query | take 1 | project query_id);
+    let query_series_raw = toscalar(Query | take 1 | project series);
+    let query_length = array_length(query_series_raw);
+    let alphabet = sax_alphabet(alphabet_size);
+    // Z-normalize first, then derive breakpoints from normalized values
+    let query_normalized = sax_znorm(query_series_raw, znorm_threshold);
+    let breakpoints = sax_breakpoints_query(query_normalized, alphabet_size);
+    let bp_len = array_length(breakpoints);
+    // Compute query PAA using integer binning (array_slice + array_sum)
+    let QueryPaaTable =
+        range seg from 0 to query_length_symbols - 1 step 1
+        | extend _qs = toint(floor(todouble(seg) * todouble(query_length) / todouble(query_length_symbols), 1))
+        | extend _qe = toint(floor(todouble(seg + 1) * todouble(query_length) / todouble(query_length_symbols), 1)) - 1
+        | extend _qe = max_of(_qs, _qe)
+        | extend _qslice = array_slice(query_normalized, _qs, _qe)
+        | extend paa_value = todouble(array_sum(_qslice)) / todouble(_qe - _qs + 1)
+        | extend symbol_index = toint(array_sum(series_greater_equals(repeat(paa_value, bp_len), breakpoints))) - 1
+        | extend symbol = tostring(alphabet[symbol_index])
+        | order by seg asc;
+    let query_paa = toscalar(QueryPaaTable | summarize make_list(paa_value));
+    let query_word = toscalar(QueryPaaTable | summarize strcat_array(make_list(symbol), ""));
+    // Precompute query symbol indices for tolerance comparison
+    let query_sym_indices = toscalar(QueryPaaTable | summarize make_list(symbol_index));
+    // Query constants for the vectorized distance identity (fast path)
+    let Sq = toscalar(QueryPaaTable | summarize sum(paa_value));
+    let Sqq = toscalar(QueryPaaTable | summarize sum(paa_value * paa_value));
+    // --- Scale windows ---
+    // When min_scale == max_scale every step maps to the same window size, so collapse
+    // the sweep to a single evaluation instead of redundantly testing identical scales.
+    let effective_scale_steps = iff(min_scale == max_scale, 1, scale_steps);
+    let scale_denominator = iff(effective_scale_steps <= 1, real(1), todouble(effective_scale_steps - 1));
+    let ScaleWindows =
+        range scale_index from 0 to effective_scale_steps - 1 step 1
+        | extend scale = iff(effective_scale_steps <= 1, min_scale, min_scale + (max_scale - min_scale) * todouble(scale_index) / scale_denominator)
+        | extend window_size = toint(max_of(1, round(todouble(query_length) * scale)))
+        | summarize by scale_index, scale, window_size;
+    // --- Convolution filters for the vectorized fast path (one row per scale) ---
+    // Each PAA segment k of a window of length W maps to a rolling-mean tap. With
+    // floor partitioning every segment has length L=floor(W/P) or L+1, so we only
+    // need two rolling means. For output index t=i+(W-1), segment k's mean is at
+    // tap delay d_k=(W-1)-seg_end_k. These filters place weight 1 (for T1/T2) or q_k
+    // (for T3) at delay d_k, split by segment length (low=L, high=L+1).
+    let SegTaps =
+        ScaleWindows
+        | extend _L = toint(floor(todouble(window_size) / todouble(query_length_symbols), 1))
+        | mv-expand k = range(0, query_length_symbols - 1, 1) to typeof(long)
+        | extend _ss = toint(floor(todouble(k) * todouble(window_size) / todouble(query_length_symbols), 1))
+        | extend _se = toint(floor(todouble(k + 1) * todouble(window_size) / todouble(query_length_symbols), 1)) - 1
+        | extend _len = _se - _ss + 1
+        | extend _delay = (window_size - 1) - _se
+        | extend _qk = todouble(query_paa[toint(k)])
+        | extend _is_low = iff(_len == _L, true, false)
+        | project scale_index, _delay, _qk, _is_low;
+    let ScaleFilters =
+        ScaleWindows
+        | extend _L = toint(floor(todouble(window_size) / todouble(query_length_symbols), 1))
+        | extend _Lf = window_size - _L + 1
+        | mv-expand d = range(0, _Lf - 1, 1) to typeof(long)
+        | join kind=leftouter SegTaps on scale_index, $left.d == $right._delay
+        | extend _ol_v = iff(isnotnull(_delay) and _is_low, 1.0, 0.0)
+        | extend _oh_v = iff(isnotnull(_delay) and not(_is_low), 1.0, 0.0)
+        | extend _ql_v = iff(isnotnull(_delay) and _is_low, _qk, 0.0)
+        | extend _qh_v = iff(isnotnull(_delay) and not(_is_low), _qk, 0.0)
+        // Ordered make_list scatters the taps into dense filter arrays (index = delay).
+        | order by scale_index asc, d asc
+        | summarize _ol = make_list(_ol_v), _oh = make_list(_oh_v),
+                    _ql = make_list(_ql_v), _qh = make_list(_qh_v) by scale_index;
+    // --- Automatic memory batching (no user parameter) ---
+    // Peak memory is bounded by splitting the work into many small partitions and
+    // running Phases A-D per partition. The ScaleWindows join and length filter are
+    // applied BEFORE partitioning so the subquery references no external table; this
+    // enables the `native` strategy to stream thousands of small partitions. Rows
+    // are split by (series_id, scale_index) for fine granularity, and the query-
+    // derived arrays are carried as columns so `native` sees no external source.
+    let Scaled =
+        SearchSpace
+        | extend series_length = array_length(series), _jk = 1
+        | join kind=inner (ScaleWindows | extend _jk = 1) on _jk
+        | project-away _jk
+        | where series_length >= window_size and window_size >= query_length_symbols
+        | extend _num_windows = series_length - window_size + 1;
+    let target_expand_rows = 2000000;
+    let total_windows = toscalar(Scaled | summarize sum(_num_windows));
+    let windows_budget = max_of(tolong(1), tolong(target_expand_rows) / tolong(max_of(1, query_length_symbols)));
+    let num_buckets = tolong(max_of(tolong(1), (total_windows + windows_budget - tolong(1)) / windows_budget));
+    let Batched =
+        Scaled
+        | extend _batch = abs(hash(strcat(series_id, "#", tostring(scale_index))) % num_buckets),
+                 _qpaa = query_paa, _qsym = query_sym_indices, _bp = breakpoints, _bplen = bp_len;
+    // --- Fast path (symbol_tolerance <= 0): fully vectorized convolution distance ---
+    // The exact PAA distance for EVERY window is computed from a handful of
+    // series_fir convolutions (T1=sum a_k, T2=sum a_k^2, T3=sum q_k a_k), using the
+    // identity dist^2 = (1/s^2)[T2 - 2 mu T1 + P mu^2] - (2/s)[T3 - mu Sq] + Sqq.
+    // Only the resulting 1-D distance array is expanded, so the paa_size x
+    // num_windows expansion is eliminated. No symbols are computed here (no filter);
+    // symbolic_distance is backfilled for the survivors in Phase E.
+    let BatchedFast =
+        Batched
+        | where symbol_tolerance <= 0
+        | join kind=inner ScaleFilters on scale_index
+        | project-away scale_index1
+        | extend _Sq = Sq, _Sqq = Sqq;
+    let PerBatchFast =
+        BatchedFast
+        | partition hint.strategy=native by _batch (
+            // Rolling window mean / population std, aligned to window starts
+            extend _rolling_mean = array_slice(series_fir(series, repeat(1.0, window_size), true, false), window_size - 1, series_length - 1)
+            | extend _rolling_meansq = array_slice(series_fir(series_multiply(series, series), repeat(1.0, window_size), true, false), window_size - 1, series_length - 1)
+            | extend _rolling_var = series_subtract(_rolling_meansq, series_multiply(_rolling_mean, _rolling_mean))
+            | extend _rolling_std = series_pow(series_abs(_rolling_var), repeat(0.5, _num_windows))
+            | extend _std_mask = series_greater_equals(_rolling_std, repeat(znorm_threshold, _num_windows))
+            | extend _safe_std = series_add(series_multiply(_rolling_std, _std_mask), series_subtract(repeat(1.0, _num_windows), _std_mask))
+            // Segment means = rolling means of length L=floor(W/P) and L+1
+            | extend _L = toint(floor(todouble(window_size) / todouble(query_length_symbols), 1))
+            | extend _A_low = series_fir(series, repeat(1.0, _L), true, false)
+            | extend _A_high = series_fir(series, repeat(1.0, _L + 1), true, false)
+            // T1/T2/T3 via comb convolutions (low + high taps), evaluated at t=i+(W-1)
+            | extend _T1f = series_add(series_fir(_A_low, _ol, false, false), series_fir(_A_high, _oh, false, false))
+            | extend _T2f = series_add(series_fir(series_multiply(_A_low, _A_low), _ol, false, false), series_fir(series_multiply(_A_high, _A_high), _oh, false, false))
+            | extend _T3f = series_add(series_fir(_A_low, _ql, false, false), series_fir(_A_high, _qh, false, false))
+            | extend _T1 = array_slice(_T1f, window_size - 1, series_length - 1)
+            | extend _T2 = array_slice(_T2f, window_size - 1, series_length - 1)
+            | extend _T3 = array_slice(_T3f, window_size - 1, series_length - 1)
+            // dist^2 = (1/s^2)[T2 - 2 mu T1 + P mu^2] - (2/s)[T3 - mu Sq] + Sqq
+            | extend _invs = series_divide(repeat(1.0, _num_windows), _safe_std)
+            | extend _brk1 = series_add(
+                series_subtract(_T2, series_multiply(repeat(2.0, _num_windows), series_multiply(_rolling_mean, _T1))),
+                series_multiply(repeat(todouble(query_length_symbols), _num_windows), series_multiply(_rolling_mean, _rolling_mean)))
+            | extend _brk2 = series_subtract(_T3, series_multiply(_rolling_mean, repeat(_Sq, _num_windows)))
+            | extend _dist_sq = series_add(
+                series_subtract(
+                    series_multiply(series_multiply(_invs, _invs), _brk1),
+                    series_multiply(repeat(2.0, _num_windows), series_multiply(_invs, _brk2))),
+                repeat(_Sqq, _num_windows))
+            | extend _distance_arr = series_pow(series_abs(_dist_sq), repeat(0.5, _num_windows))
+            // Expand ONLY the 1-D distance array (num_windows scalars per row)
+            | project series_id, window_size, scale_index, scale, _distance_arr
+            | mv-expand with_itemindex=_win_idx _dist_val = _distance_arr to typeof(real)
+            | extend start_index = tolong(_win_idx)
+            | extend end_index = start_index + tolong(window_size) - 1
+            | extend distance = todouble(_dist_val)
+            | extend similarity = 1.0 / (1.0 + distance)
+            | extend max_symbol_dist = tolong(-1)
+            | top top_k by similarity desc
+            | project series_id, start_index, end_index, window_size,
+                      scale_index, scale, max_symbol_dist, distance, similarity
+        );
+    // --- Symbolic path (symbol_tolerance > 0): per-segment symbols for the tolerance filter ---
+    let BatchedSym = Batched | where symbol_tolerance > 0;
+    let PerBatchSym =
+        BatchedSym
+        | partition hint.strategy=native by _batch (
+            // Phase A: rolling window statistics (vectorized, O(N) per series)
+            extend _fir_coeff = repeat(1.0, window_size)
+            | extend _rolling_mean = array_slice(series_fir(series, _fir_coeff, true, false), window_size - 1, series_length - 1)
+            | extend _rolling_meansq = array_slice(series_fir(series_multiply(series, series), _fir_coeff, true, false), window_size - 1, series_length - 1)
+            | extend _rolling_var = series_subtract(_rolling_meansq, series_multiply(_rolling_mean, _rolling_mean))
+            | extend _rolling_std = series_pow(series_abs(_rolling_var), repeat(0.5, _num_windows))
+            | extend _std_mask = series_greater_equals(_rolling_std, repeat(znorm_threshold, _num_windows))
+            | extend _safe_std = series_add(
+                series_multiply(_rolling_std, _std_mask),
+                series_subtract(repeat(1.0, _num_windows), _std_mask))
+            | project series_id, window_size, scale_index, scale, _num_windows, _rolling_mean, _safe_std,
+                      series, _qpaa, _qsym, _bp, _bplen
+            // Phase B: per-segment PAA via series_fir (single mv-apply over paa_size segments).
+            // Slim payload: carry ONE array (_paa_k) plus scalars; no per-window diff arrays.
+            | mv-apply seg_k = range(0, query_length_symbols - 1, 1) to typeof(long) on (
+                extend _seg_start = toint(floor(todouble(seg_k) * todouble(window_size) / todouble(query_length_symbols), 1))
+                | extend _seg_end = toint(floor(todouble(seg_k + 1) * todouble(window_size) / todouble(query_length_symbols), 1)) - 1
+                | extend _seg_end = max_of(_seg_start, _seg_end)
+                | extend _seg_len = _seg_end - _seg_start + 1
+                | extend _seg_fir_full = series_fir(series, repeat(1.0, _seg_len), true, false)
+                | extend _raw_seg_mean = array_slice(_seg_fir_full, _seg_end, _seg_end + _num_windows - 1)
+                | extend _paa_k = series_divide(series_subtract(_raw_seg_mean, _rolling_mean), _safe_std)
+                | extend _q_k = todouble(_qpaa[toint(seg_k)])
+                | extend _q_sym_idx_k = toint(_qsym[toint(seg_k)])
+                | project seg_k, _paa_k, _q_k, _q_sym_idx_k
+            )
+            | project-away series, _rolling_mean, _safe_std
+            // Phase C: flatten window dimension + symbolize + aggregate to SCALARS only.
+            | mv-expand with_itemindex=_win_idx _paa_val = _paa_k to typeof(real)
+            | extend _sym_idx = toint(array_sum(series_greater_equals(repeat(_paa_val, _bplen), _bp))) - 1
+            | extend _sym_dist = abs(_sym_idx - _q_sym_idx_k)
+            | extend _dsq_val = (_paa_val - _q_k) * (_paa_val - _q_k)
+            | summarize
+                max_symbol_dist = max(_sym_dist),
+                _total_dist_sq = sum(_dsq_val)
+              by series_id, scale_index, scale, window_size, _win_idx
+            // Phase D: symbolic filter + distance + per-batch top-k
+            | where max_symbol_dist <= symbol_tolerance
+            | extend start_index = tolong(_win_idx)
+            | extend end_index = start_index + tolong(window_size) - 1
+            | extend distance = sqrt(_total_dist_sq)
+            | extend similarity = 1.0 / (1.0 + distance)
+            | top top_k by similarity desc
+            | project series_id, start_index, end_index, window_size,
+                      scale_index, scale, max_symbol_dist, distance, similarity
+        );
+    let PerBatch = union PerBatchFast, PerBatchSym;
+    // --- Global top-k across batches (small: <= num_buckets * top_k rows) ---
+    let TopResults =
+        PerBatch
+        | top top_k by similarity desc;
+    // --- Phase E: reconstruct candidate_paa / candidate_word for survivors ONLY ---
+    // Join back to the raw series and recompute PAA on the single matched window.
+    // This mirrors Phase B math exactly (population-std z-normalization of the window).
+    TopResults
+    | join kind=inner (SearchSpace | project series_id, _full_series = series) on series_id
+    | project-away series_id1
+    | extend _win = array_slice(_full_series, start_index, end_index)
+    | extend _win_len = array_length(_win)
+    | extend _wmean = todouble(array_sum(_win)) / todouble(_win_len)
+    | extend _wmeansq = todouble(array_sum(series_multiply(_win, _win))) / todouble(_win_len)
+    | extend _wvar = _wmeansq - _wmean * _wmean
+    | extend _wstd = sqrt(abs(_wvar))
+    | extend _wsafe_std = iff(_wstd >= znorm_threshold, _wstd, 1.0)
+    | mv-apply seg_k = range(0, query_length_symbols - 1, 1) to typeof(long) on (
+        extend _seg_start = toint(floor(todouble(seg_k) * todouble(window_size) / todouble(query_length_symbols), 1))
+        | extend _seg_end = toint(floor(todouble(seg_k + 1) * todouble(window_size) / todouble(query_length_symbols), 1)) - 1
+        | extend _seg_end = max_of(_seg_start, _seg_end)
+        | extend _seg_slice = array_slice(_win, _seg_start, _seg_end)
+        | extend _raw_seg_mean = todouble(array_sum(_seg_slice)) / todouble(_seg_end - _seg_start + 1)
+        | extend _v = (_raw_seg_mean - _wmean) / _wsafe_std
+        | extend _sidx = toint(array_sum(series_greater_equals(repeat(_v, bp_len), breakpoints))) - 1
+        | extend _s = tostring(alphabet[_sidx])
+        | extend _qsi = toint(query_sym_indices[toint(seg_k)])
+        | extend _sd = abs(_sidx - _qsi)
+        | summarize candidate_paa = make_list(_v), candidate_word = strcat_array(make_list(_s), ""),
+                    _recon_sym_dist = max(_sd)
+    )
+    | project query_id = query_id_val, series_id, start_index, end_index, matched_length = window_size,
+              scale_index, scale, query_word, candidate_word,
+              symbolic_distance = iff(max_symbol_dist < 0, todouble(_recon_sym_dist), todouble(max_symbol_dist)),
+              distance, similarity,
+              explain = bag_pack("breakpoints", breakpoints, "query_paa", query_paa, "candidate_paa", candidate_paa)
+    | order by similarity desc, distance asc, series_id asc, start_index asc
+    | serialize rank = row_number()
+    | where rank <= top_k
+}

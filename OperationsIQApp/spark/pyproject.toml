@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tsmp"
+version = "0.1.0"
+description = "Time-Series Matrix Profile compute core (MPX, MOMP, DAMP) for the Fabric Motif & Discord Explorer"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+spark = [
+    "pyspark>=3.4",
+]
+test = [
+    "pytest>=7",
+    "stumpy>=1.12",
+    "pyspark>=3.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tsmp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

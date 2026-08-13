@@ -1,0 +1,263 @@
+// ============================================================================
+// Causal FIR change-point ensemble
+// ----------------------------------------------------------------------------
+// PURPOSE
+//   Detects coordinated level and slope changes with causal prior-vs-recent mean
+//   contrasts. Seasonal structure is removed, while trend is intentionally kept.
+//
+// INTERPRETATION
+//   Each score at event_index compares two adjacent contrast_window_bins windows
+//   ending at that point. detection_window selects only the final bins to report.
+//   Level and optional slope contrasts are robustly scored per track, then reduced
+//   with the same RMS/vote/extreme rule as residual voting.
+//
+// MEMORY / LATENCY
+//   FIR filtering and robust scoring stay vectorized. Only final score/contrast
+//   arrays are expanded. The causal filter introduces a two-window warm-up and
+//   cannot report a persistent change until the recent window has populated.
+//
+// EXAMPLE
+//   mvad_change_point_ensemble(
+//       SeriesTable, 30m, 0, 8, 1.5, 1.2, 2, 0.5, 3.0, true, false)
+// ============================================================================
+
+.create-or-alter function with (
+    folder = "MVAD/Detectors",
+    docstring = "Detect coordinated level and slope changes with causal two-window FIR contrasts, robust scores, and bounded contributors."
+) mvad_change_point_ensemble(
+    SeriesTable:(
+        entity_id:string,
+        track_id:string,
+        series:dynamic,
+        series_start:datetime,
+        series_end:datetime,
+        bin_size:timespan,
+        point_count:long,
+        observed_bins:long,
+        coverage:real,
+        max_missing_run:long,
+        is_valid:bool,
+        validation_error:string
+    ),
+    detection_window:timespan,
+    seasonality:int,
+    contrast_window_bins:int,
+    track_score_threshold:real,
+    change_rms_threshold:real,
+    min_track_votes:int,
+    min_vote_fraction:real,
+    extreme_track_threshold:real,
+    detect_slope_changes:bool,
+    emit_all_scores:bool)
+{
+    let _parameters_are_valid = assert(
+        detection_window > 0s
+            and (seasonality == -1 or seasonality >= 0)
+            and contrast_window_bins >= 2
+            and contrast_window_bins <= 4096
+            and track_score_threshold > 0.0
+            and change_rms_threshold > 0.0
+            and min_track_votes >= 1
+            and min_vote_fraction > 0.0
+            and min_vote_fraction <= 1.0
+            and extreme_track_threshold > 0.0,
+        "mvad_change_point_ensemble: invalid detection, seasonality, contrast-window, threshold, or vote parameter."
+    );
+    let _warmup_bins = tolong(2 * contrast_window_bins);
+    let _minimum_history = tolong(max_of(16, _warmup_bins + 8));
+    let _validated_series = SeriesTable | where _parameters_are_valid;
+    let _profiles =
+        materialize(
+            mvad_entity_profile(
+                _validated_series,
+                detection_window,
+                _minimum_history
+            )
+        );
+    // Filter coefficient index is a causal delay: the first half weights the
+    // recent window positively and the second half weights the prior window
+    // negatively. normalize=false is required because the coefficients sum to 0.
+    let _contrast_filter = array_concat(
+        repeat(1.0 / todouble(contrast_window_bins), contrast_window_bins),
+        repeat(-1.0 / todouble(contrast_window_bins), contrast_window_bins)
+    );
+    let _track_evidence =
+        materialize(
+            SeriesTable
+            | join kind=inner (
+                _profiles
+                | where status == "ok"
+                | project
+                    entity_id,
+                    _profile_start = series_start,
+                    _profile_end = series_end,
+                    _profile_bin = bin_size,
+                    _profile_points = point_count,
+                    detection_bins,
+                    _profile_track_count = track_count
+            ) on entity_id
+            | extend _deseasonalized = mvad_causal_deseason(series, seasonality)
+            | extend
+                _level_full = series_fir(_deseasonalized, _contrast_filter, false, false),
+                _difference_full = series_fir(_deseasonalized, dynamic([1.0, -1.0]), false, false)
+            | extend _slope_full =
+                series_fir(_difference_full, _contrast_filter, false, false)
+            // Remove FIR warm-up before robust scoring so partial-filter values do
+            // not define the Tukey fences. The slope path needs one extra sample.
+            | extend
+                _level_valid = array_slice(_level_full, _warmup_bins - 1, _profile_points - 1),
+                _slope_valid = array_slice(_slope_full, _warmup_bins, _profile_points - 1)
+            | extend
+                _level_scores_valid = series_abs(series_outliers(_level_valid, "ctukey")),
+                _slope_scores_valid = iff(
+                    detect_slope_changes,
+                    series_abs(series_outliers(_slope_valid, "ctukey")),
+                    repeat(0.0, array_length(_slope_valid))
+                )
+            | extend
+                _level_score_tail = array_slice(
+                    _level_scores_valid,
+                    array_length(_level_scores_valid) - detection_bins,
+                    array_length(_level_scores_valid) - 1
+                ),
+                _slope_score_tail = array_slice(
+                    _slope_scores_valid,
+                    array_length(_slope_scores_valid) - detection_bins,
+                    array_length(_slope_scores_valid) - 1
+                ),
+                _level_contrast_tail = array_slice(
+                    _level_valid,
+                    array_length(_level_valid) - detection_bins,
+                    array_length(_level_valid) - 1
+                ),
+                _slope_contrast_tail = array_slice(
+                    _slope_valid,
+                    array_length(_slope_valid) - detection_bins,
+                    array_length(_slope_valid) - 1
+                )
+            | mv-expand with_itemindex=_offset
+                _level_score = _level_score_tail to typeof(real),
+                _slope_score = _slope_score_tail to typeof(real),
+                _level_contrast = _level_contrast_tail to typeof(real),
+                _slope_contrast = _slope_contrast_tail to typeof(real)
+            | extend
+                event_index = _profile_points - detection_bins + tolong(_offset),
+                level_score = abs(todouble(_level_score)),
+                slope_score = iff(detect_slope_changes, abs(todouble(_slope_score)), 0.0),
+                level_contrast = todouble(_level_contrast),
+                slope_contrast = iff(detect_slope_changes, todouble(_slope_contrast), 0.0)
+            | extend track_score = iff(
+                detect_slope_changes,
+                sqrt((level_score * level_score + slope_score * slope_score) / 2.0),
+                level_score
+            )
+            | where
+                isfinite(track_score)
+                and isfinite(level_contrast)
+                and isfinite(slope_contrast)
+            | project
+                entity_id,
+                track_id,
+                event_index,
+                track_score,
+                level_score,
+                slope_score,
+                level_contrast,
+                slope_contrast,
+                series_start = _profile_start,
+                series_end = _profile_end,
+                bin_size = _profile_bin,
+                track_count = _profile_track_count
+        );
+    let _scores =
+        materialize(
+            _track_evidence
+            | summarize
+                _sum_score_squared = sum(track_score * track_score),
+                _max_track_score = max(track_score),
+                vote_count = countif(track_score >= track_score_threshold),
+                series_start = any(series_start),
+                series_end = any(series_end),
+                bin_size = any(bin_size),
+                track_count = any(track_count)
+              by entity_id, event_index
+            | extend
+                score = sqrt(_sum_score_squared / todouble(track_count)),
+                vote_count = tolong(vote_count),
+                vote_fraction = todouble(vote_count) / todouble(track_count),
+                _required_votes = tolong(max_of(
+                    min_track_votes,
+                    ceiling(min_vote_fraction * todouble(track_count))
+                ))
+            | extend is_anomaly =
+                score >= change_rms_threshold
+                or vote_count >= _required_votes
+                or _max_track_score >= extreme_track_threshold
+            | extend severity = max_of(
+                score / change_rms_threshold,
+                todouble(vote_count) / todouble(_required_votes),
+                _max_track_score / extreme_track_threshold
+            )
+            | where emit_all_scores or is_anomaly
+        );
+    let _contributors =
+        _track_evidence
+        | join kind=inner (
+            _scores
+            | project entity_id, event_index
+        ) on entity_id, event_index
+        | extend
+            _change_type = case(
+                level_score >= track_score_threshold and slope_score >= track_score_threshold, "mixed",
+                slope_score >= level_score, "slope_break",
+                "level_shift"
+            ),
+            _direction = case(
+                abs(slope_contrast) > abs(level_contrast), sign(slope_contrast),
+                sign(level_contrast)
+            )
+        | order by entity_id asc, event_index asc, track_score desc
+        | serialize _group = strcat(entity_id, "|", event_index)
+        | extend _rank = row_number(1, _group != prev(_group))
+        | where _rank <= 5
+        | summarize contributors = make_list(bag_pack(
+            "track_id", track_id,
+            "change_type", _change_type,
+            "direction", _direction,
+            "track_score", track_score,
+            "level_score", level_score,
+            "slope_score", slope_score,
+            "level_contrast", level_contrast,
+            "slope_contrast", slope_contrast
+        )) by entity_id, event_index;
+    let _results =
+        _scores
+        | join kind=leftouter _contributors on entity_id, event_index
+        | project
+            entity_id,
+            algorithm = "change_point",
+            event_index,
+            event_time = series_start + event_index * bin_size,
+            window_start = series_start + (event_index - _warmup_bins + 1) * bin_size,
+            window_end = series_start + (event_index + 1) * bin_size,
+            score,
+            threshold = change_rms_threshold,
+            severity,
+            is_anomaly,
+            vote_count,
+            vote_fraction,
+            track_count,
+            contributors = coalesce(contributors, dynamic([])),
+            status = "ok",
+            explain = bag_pack(
+                "contrast_window_bins", contrast_window_bins,
+                "track_score_threshold", track_score_threshold,
+                "required_votes", _required_votes,
+                "maximum_track_score", _max_track_score,
+                "detect_slope_changes", detect_slope_changes,
+                "seasonality", seasonality
+            );
+    let _diagnostics =
+        mvad_diagnostic_results(_profiles, "change_point");
+    union _results, _diagnostics
+}

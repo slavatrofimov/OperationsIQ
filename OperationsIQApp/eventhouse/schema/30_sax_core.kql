@@ -1,0 +1,224 @@
+// Core SAX helper functions.
+// Deploy with .execute database script <| or copy each .create-or-alter command
+// into a KQL database management command.
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Return the supported SAX alphabet prefix as a dynamic array."
+) sax_alphabet(alphabet_size:int)
+{
+    array_slice(dynamic([
+        "a","b","c","d","e","f","g","h","i","j",
+        "k","l","m","n","o","p","q","r","s","t"
+    ]), 0, alphabet_size - 1)
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Return Gaussian SAX lower breakpoints for alphabet sizes 2-20. The first value is a -infinity sentinel."
+) sax_breakpoints_gaussian(alphabet_size:int)
+{
+    case(
+        alphabet_size == 2, dynamic([-1e308, 0.0]),
+        alphabet_size == 3, dynamic([-1e308, -0.43072729929545756, 0.43072729929545744]),
+        alphabet_size == 4, dynamic([-1e308, -0.6744897501960817, 0.0, 0.6744897501960817]),
+        alphabet_size == 5, dynamic([-1e308, -0.8416212335729142, -0.2533471031357997, 0.2533471031357997, 0.8416212335729143]),
+        alphabet_size == 6, dynamic([-1e308, -0.967421566101701, -0.43072729929545756, 0.0, 0.43072729929545744, 0.967421566101701]),
+        alphabet_size == 7, dynamic([-1e308, -1.0675705238781414, -0.5659488219328631, -0.1800123697927051, 0.18001236979270496, 0.5659488219328631, 1.0675705238781412]),
+        alphabet_size == 8, dynamic([-1e308, -1.1503493803760079, -0.6744897501960817, -0.31863936396437514, 0.0, 0.31863936396437514, 0.6744897501960817, 1.1503493803760079]),
+        alphabet_size == 9, dynamic([-1e308, -1.22064034884735, -0.7647096737863871, -0.43072729929545756, -0.13971029888186212, 0.13971029888186212, 0.43072729929545744, 0.7647096737863871, 1.22064034884735]),
+        alphabet_size == 10, dynamic([-1e308, -1.2815515655446004, -0.8416212335729142, -0.5244005127080409, -0.2533471031357997, 0.0, 0.2533471031357997, 0.5244005127080407, 0.8416212335729143, 1.2815515655446004]),
+        alphabet_size == 11, dynamic([-1e308, -1.3351777361189363, -0.9084578685373851, -0.6045853465832372, -0.3487556955170447, -0.11418529432142838, 0.11418529432142838, 0.3487556955170447, 0.6045853465832372, 0.9084578685373854, 1.3351777361189363]),
+        alphabet_size == 12, dynamic([-1e308, -1.382994127100638, -0.967421566101701, -0.6744897501960817, -0.43072729929545756, -0.2104283942479247, 0.0, 0.21042839424792456, 0.43072729929545744, 0.6744897501960817, 0.967421566101701, 1.382994127100638]),
+        alphabet_size == 13, dynamic([-1e308, -1.426076872272849, -1.0200762327862003, -0.7363159173761293, -0.5024022233733555, -0.2933812321211932, -0.09655861528963908, 0.09655861528963908, 0.2933812321211932, 0.5024022233733555, 0.7363159173761294, 1.0200762327862003, 1.426076872272849]),
+        alphabet_size == 14, dynamic([-1e308, -1.4652337926855231, -1.0675705238781414, -0.7916386077433746, -0.5659488219328631, -0.3661063568005698, -0.1800123697927051, 0.0, 0.18001236979270496, 0.3661063568005698, 0.5659488219328631, 0.7916386077433746, 1.0675705238781412, 1.4652337926855231]),
+        alphabet_size == 15, dynamic([-1e308, -1.501085946044025, -1.1107716166367856, -0.8416212335729142, -0.6229257232100879, -0.43072729929545756, -0.2533471031357997, -0.08365173390712909, 0.08365173390712909, 0.2533471031357997, 0.43072729929545744, 0.6229257232100879, 0.8416212335729143, 1.1107716166367856, 1.501085946044025]),
+        alphabet_size == 16, dynamic([-1e308, -1.5341205443525463, -1.1503493803760079, -0.887146559018876, -0.6744897501960817, -0.4887764111146695, -0.31863936396437514, -0.1573106846101707, 0.0, 0.1573106846101707, 0.31863936396437514, 0.4887764111146695, 0.6744897501960817, 0.887146559018876, 1.1503493803760079, 1.5341205443525463]),
+        alphabet_size == 17, dynamic([-1e308, -1.5647264713617984, -1.186831432755819, -0.929861508836477, -0.7215222839823438, -0.541395085129088, -0.3773919438285545, -0.22300783094036725, -0.0737912738082727, 0.0737912738082727, 0.22300783094036725, 0.3773919438285543, 0.541395085129088, 0.7215222839823438, 0.929861508836477, 1.186831432755819, 1.5647264713617984]),
+        alphabet_size == 18, dynamic([-1e308, -1.5932188180230507, -1.22064034884735, -0.967421566101701, -0.7647096737863871, -0.5894557978497785, -0.43072729929545756, -0.28221614706250836, -0.13971029888186212, 0.0, 0.13971029888186212, 0.28221614706250836, 0.43072729929545744, 0.5894557978497784, 0.7647096737863871, 0.967421566101701, 1.22064034884735, 1.5932188180230507]),
+        alphabet_size == 19, dynamic([-1e308, -1.6198562586382699, -1.2521195202652196, -1.0031479676625337, -0.8045963803603002, -0.63364, -0.47950565333095015, -0.336038140371823, -0.19920132478926703, -0.06601181237584068, 0.06601181237584068, 0.19920132478926703, 0.336038140371823, 0.47950565333095015, 0.63364, 0.8045963803603002, 1.0031479676625337, 1.2521195202652196, 1.6198562586382699]),
+        alphabet_size == 20, dynamic([-1e308, -1.6448536269514729, -1.2815515655446004, -1.0364333894937898, -0.8416212335729142, -0.6744897501960817, -0.5244005127080409, -0.38532046640756773, -0.2533471031357997, -0.12566134685507402, 0.0, 0.12566134685507416, 0.2533471031357997, 0.38532046640756773, 0.5244005127080407, 0.6744897501960817, 0.8416212335729143, 1.0364333894937898, 1.2815515655446004, 1.6448536269514722]),
+        dynamic([])
+    )
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Return query-fitted SAX lower breakpoints by nearest-rank quantiles over the query values. The first value is a -infinity sentinel."
+) sax_breakpoints_query(query_series:dynamic, alphabet_size:int)
+{
+    let values =
+        print series = query_series
+        | mv-expand value = series to typeof(real)
+        | where isfinite(value)
+        | sort by value asc
+        | serialize rn = row_number() - 1;
+    let n = toscalar(values | summarize count());
+    toscalar(
+        range cut_index from 0 to alphabet_size - 1 step 1
+        | extend breakpoint = iff(cut_index == 0, real(-1e308), todouble(cut_index) * todouble(n) / todouble(alphabet_size))
+        | extend value_rank = tolong(min_of(n - 1, max_of(0, floor(breakpoint, 1))))
+        | join kind=leftouter (values | project value_rank = rn, cut_value = value) on value_rank
+        | extend cut = iff(cut_index == 0, real(-1e308), cut_value)
+        | order by cut_index asc
+        | summarize breakpoints = make_list(cut)
+    )
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Population z-normalize a dynamic numeric array. Low-variance arrays are mean-centered without division."
+) sax_znorm(series:dynamic, znorm_threshold:real)
+{
+    let n = array_length(series);
+    // series_stats_dynamic is scalar and row-safe, so sax_znorm can run per row
+    // over dynamic columns used by discords, VSM, and multidim reconstruction.
+    let _stats = series_stats_dynamic(series);
+    let mean_val = todouble(_stats.avg);
+    // series_stats returns sample variance (n-1 divisor); convert to population variance
+    let sample_var = todouble(_stats.variance);
+    let pop_var = iff(n > 1, sample_var * todouble(n - 1) / todouble(n), 0.0);
+    let stdev_val = sqrt(max_of(0.0, pop_var));
+    let mean_array = repeat(mean_val, n);
+    iff(stdev_val >= znorm_threshold,
+        series_divide(series_subtract(series, mean_array), repeat(stdev_val, n)),
+        series_subtract(series, mean_array)
+    )
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Fractional Piecewise Aggregate Approximation over a dynamic numeric array."
+) sax_paa(series:dynamic, paa_size:int)
+{
+    let n = array_length(series);
+    let samples =
+        print series = series
+        | mv-expand with_itemindex = sample_index value = series to typeof(real)
+        | extend sample_index = tolong(sample_index),
+                 sample_start = todouble(sample_index),
+                 sample_end = todouble(sample_index + 1),
+                 join_key = 1;
+    let segments =
+        range segment_index from 0 to paa_size - 1 step 1
+        | extend segment_start = todouble(segment_index) * todouble(n) / todouble(paa_size),
+                 segment_end = todouble(segment_index + 1) * todouble(n) / todouble(paa_size),
+                 join_key = 1;
+    toscalar(
+        segments
+        | join kind=inner samples on join_key
+        | extend overlap = max_of(0.0, min_of(sample_end, segment_end) - max_of(sample_start, segment_start))
+        | where overlap > 0.0
+        | summarize paa_value = sum(value * overlap) / sum(overlap) by segment_index
+        | order by segment_index asc
+        | summarize paa = make_list(paa_value)
+    )
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Convert PAA values into a SAX word using supplied lower breakpoints."
+) sax_symbolize_values(values:dynamic, breakpoints:dynamic, alphabet_size:int)
+{
+    let alphabet = sax_alphabet(alphabet_size);
+    let bp_len = array_length(breakpoints);
+    toscalar(
+        print values = values
+        | mv-expand with_itemindex = position value = values to typeof(real)
+        | extend position = tolong(position)
+        // For each value, count how many breakpoints it is >= (gives 1-based symbol ordinal)
+        | extend symbol_index = toint(array_sum(series_greater_equals(repeat(value, bp_len), breakpoints))) - 1
+        | extend symbol = tostring(alphabet[symbol_index])
+        | order by position asc
+        | summarize symbols = make_list(symbol)
+        | project word = strcat_array(symbols, "")
+    )
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Convert a dynamic numeric array to a SAX word with supplied lower breakpoints."
+) sax_word(series:dynamic, paa_size:int, breakpoints:dynamic, alphabet_size:int, znorm_threshold:real)
+{
+    sax_symbolize_values(sax_paa(sax_znorm(series, znorm_threshold), paa_size), breakpoints, alphabet_size)
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Euclidean distance between two numeric dynamic arrays of the same logical length."
+) sax_euclidean_arrays(left_values:dynamic, right_values:dynamic)
+{
+    let diff = series_subtract(left_values, right_values);
+    sqrt(array_sum(series_multiply(diff, diff)))
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Euclidean distance between PAA representations of two z-normalized series."
+) sax_paa_distance(left_series:dynamic, right_series:dynamic, paa_size:int, znorm_threshold:real)
+{
+    sax_euclidean_arrays(
+        sax_paa(sax_znorm(left_series, znorm_threshold), paa_size),
+        sax_paa(sax_znorm(right_series, znorm_threshold), paa_size)
+    )
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Average per-symbol ordinal distance between two SAX words."
+) sax_symbol_distance(left_word:string, right_word:string)
+{
+    let len = min_of(strlen(left_word), strlen(right_word));
+    toscalar(
+        range position from 0 to len - 1 step 1
+        | extend left_symbol = substring(left_word, position, 1),
+                 right_symbol = substring(right_word, position, 1)
+        | extend left_index = indexof("abcdefghijklmnopqrst", left_symbol),
+                 right_index = indexof("abcdefghijklmnopqrst", right_symbol)
+        | summarize distance = iff(len == 0, real(null), avg(todouble(abs(left_index - right_index))))
+    )
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Maximum per-position ordinal distance between two SAX words (the tolerance-prefilter metric). Standalone helper; the search functions compute this inline for performance."
+) sax_symbol_distance_max(left_word:string, right_word:string)
+{
+    let len = min_of(strlen(left_word), strlen(right_word));
+    toscalar(
+        range position from 0 to len - 1 step 1
+        | extend left_symbol = substring(left_word, position, 1),
+                 right_symbol = substring(right_word, position, 1)
+        | extend left_index = indexof("abcdefghijklmnopqrst", left_symbol),
+                 right_index = indexof("abcdefghijklmnopqrst", right_symbol)
+        | summarize distance = iff(len == 0, real(null), todouble(max(abs(left_index - right_index))))
+    )
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Build a regex tolerance pattern for a SAX word. Each symbol is expanded to an ordinal character class."
+) sax_tolerance_regex(word:string, alphabet_size:int, symbol_tolerance:int, min_repeat:int, max_repeat:int)
+{
+    let alphabet = "abcdefghijklmnopqrst";
+    toscalar(
+        range position from 0 to strlen(word) - 1 step 1
+        | extend symbol = substring(word, position, 1)
+        | extend center = indexof(alphabet, symbol)
+        | extend low = max_of(0, center - symbol_tolerance),
+                 high = min_of(alphabet_size - 1, center + symbol_tolerance)
+        | extend chars = substring(alphabet, low, high - low + 1)
+        | extend token = strcat("[", chars, "]", iff(min_repeat == 1 and max_repeat == 1, "", strcat("{", min_repeat, ",", max_repeat, "}")))
+        | order by position asc
+        | summarize tokens = make_list(token)
+        | project regex = strcat_array(tokens, "")
+    )
+}
+
+.create-or-alter function with (
+    folder = "SAX/Core",
+    docstring = "Convert a distance to a bounded similarity score for ranking."
+) sax_similarity_from_distance(distance:real)
+{
+    1.0 / (1.0 + distance)
+}

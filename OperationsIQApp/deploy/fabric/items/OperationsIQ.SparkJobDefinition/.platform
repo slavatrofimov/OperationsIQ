@@ -1,0 +1,12 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "SparkJobDefinition",
+    "displayName": "OperationsIQ",
+    "description": "Optional headless Spark Job Definition for batch Matrix Profile pattern discovery."
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "e6a9a45a-2318-4417-9ca3-3a2f742b5552"
+  }
+}

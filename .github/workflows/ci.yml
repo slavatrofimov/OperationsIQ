@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'OperationsIQApp/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'OperationsIQApp/**'
+      - '.github/workflows/ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: typecheck / test / build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: OperationsIQApp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: OperationsIQApp/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tsmp bundle is up to date
+        run: |
+          # Content-level check: compares the DECODED payload against
+          # spark/tsmp/**, so it is robust to gzip bytes differing across Node
+          # (zlib) versions and fails only on real source drift.
+          npm run bundle:tsmp:check
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build (production bundle)
+        run: npm run build
+
+      # Production bundle sanity check: the build must emit an index.html and at
+      # least one hashed JS asset into dist/, and must NOT publish source maps
+      # (they expose auth flow, KQL construction, and agent internals). Maps are
+      # opt-in via BUILD_SOURCEMAP for private error-reporting uploads only.
+      - name: Verify production bundle
+        run: |
+          test -f dist/index.html || { echo "dist/index.html missing"; exit 1; }
+          ls dist/assets/*.js >/dev/null 2>&1 || { echo "no JS assets in dist/assets"; exit 1; }
+          if find dist -name '*.map' -print -quit | grep -q .; then
+            echo "source maps present in dist/ (must not be published)"; exit 1;
+          fi
+          echo "Production bundle OK"

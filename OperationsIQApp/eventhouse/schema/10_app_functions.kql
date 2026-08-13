@@ -1,0 +1,50 @@
+// ============================================================================
+// Operations IQ app - Eventhouse helper functions
+// ----------------------------------------------------------------------------
+// Deploy AFTER 00_tables.kql. These stored functions are the read-only KQL
+// surface the app calls directly (via the browser MSAL -> /v2/rest/query path).
+// They compose with the SAX library (schema/30-70_sax_*.kql): the *_segment
+// / *_search_space helpers emit exactly the (series_id, series) shape that
+// sax_similarity_search_1d and friends expect.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// app_extract_segment: build a single (series_id, series) row for one signal over
+// a time range. Feeds the "query" side of a 1-D similarity search when the user
+// brushes a subsequence on the exploration timeline.
+//
+// Source is a TABULAR PARAMETER carrying the canonical (SignalId, Timestamp,
+// Value) shape. Callers bind their connection profile's timeseries query onto a
+// `let Timeseries = (…canonical projection…)` and pass it in, so the function is
+// agnostic to the underlying physical column names.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "OperationsIQ/Search", docstring = "Single avg-binned, gap-filled (series_id, series) row for one signal over a range. Query input for similarity search. Source is a canonical (SignalId, Timestamp, Value) tabular argument.")
+app_extract_segment(Source: (SignalId: string, Timestamp: datetime, Value: real), tag: string, range_start: datetime, range_end: datetime, bin: timespan) {
+    Source
+    | where SignalId == tag
+    | where Timestamp between (range_start .. range_end)
+    | make-series series = avg(Value) default = real(null)
+        on Timestamp from range_start to range_end step bin
+    | extend series = series_fill_linear(series)
+    | project series_id = tag, series
+}
+
+// ---------------------------------------------------------------------------
+// app_search_space: build the (series_id, series) search space for one or more
+// signals over a time range. Feeds the SearchSpace input of
+// sax_similarity_search_1d / the per-track inputs of the multidim search.
+//
+// Source is a TABULAR PARAMETER carrying the canonical (SignalId, Timestamp,
+// Value) shape (see app_extract_segment).
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "OperationsIQ/Search", docstring = "Multi-signal (series_id, series) table over a range. Search space input for similarity search. Source is a canonical (SignalId, Timestamp, Value) tabular argument.")
+app_search_space(Source: (SignalId: string, Timestamp: datetime, Value: real), tags: dynamic, range_start: datetime, range_end: datetime, bin: timespan) {
+    Source
+    | where SignalId in (tags)
+    | where Timestamp between (range_start .. range_end)
+    | make-series series = avg(Value) default = real(null)
+        on Timestamp from range_start to range_end step bin
+        by SignalId
+    | extend series = series_fill_linear(series)
+    | project series_id = SignalId, series
+}

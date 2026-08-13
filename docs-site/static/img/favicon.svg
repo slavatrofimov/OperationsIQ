@@ -1,0 +1,26 @@
+<svg width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Operations IQ">
+  <defs>
+    <linearGradient id="oiq-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0F6CBD" />
+      <stop offset="55%" stop-color="#5B5FC7" />
+      <stop offset="100%" stop-color="#9373E6" />
+    </linearGradient>
+    <linearGradient id="oiq-line" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#7FE7FF" />
+      <stop offset="100%" stop-color="#FFFFFF" />
+    </linearGradient>
+    <radialGradient id="oiq-glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95" />
+      <stop offset="60%" stop-color="#7FE7FF" stop-opacity="0.55" />
+      <stop offset="100%" stop-color="#7FE7FF" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+  <rect x="1" y="1" width="30" height="30" rx="8" fill="url(#oiq-bg)" />
+  <g stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1">
+    <line x1="6" y1="22" x2="26" y2="22" />
+    <line x1="6" y1="16" x2="26" y2="16" />
+  </g>
+  <polyline points="5,18 9,15 12,20 16,17 20,21 23,11 27,7" fill="none" stroke="url(#oiq-line)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="23" cy="11" r="5.5" fill="url(#oiq-glow)" />
+  <circle cx="23" cy="11" r="2.1" fill="#FFFFFF" />
+</svg>

@@ -1,0 +1,92 @@
+// ============================================================================
+// Operations IQ app - Eventhouse schema (OneLake external tables)
+// ----------------------------------------------------------------------------
+// Surfaces the app's RayFin SQL DB tables (mirrored to OneLake) into the
+// companion KQL database as `kind=delta` external tables, so the connection
+// profile's Metadata / Events queries can join governed Signal Metadata and
+// user-authored Annotations server-side.
+//
+// PARAMETERIZED FILE. The retrofit tooling (eventhouse/deploy/Retrofit-Eventhouse.ps1)
+// substitutes the two OneLake Delta URIs below before posting these commands.
+// The tokens are:
+//   __ANNOTATIONS_DELTA_URI__      OneLake path to the mirrored `Annotation` delta table
+//   __SIGNAL_METADATA_DELTA_URI__  OneLake path to the mirrored `SignalMetadata` delta table
+// e.g. https://onelake.dfs.fabric.microsoft.com/<workspace>/<item>.<Type>/Tables/dbo/Annotation
+//
+// Multi-profile scoping: both tables carry the owning connection profile key
+// (`connection_profile_id` on Annotation, `scope_key` on SignalMetadata). The
+// connection-profile query templates filter on `_ConnectionProfileId` (a `let`
+// binding the app prepends at query time) so a single mirror serves many
+// profiles. See src/lib/connectionProfile.ts (EVENTS_QUERY_WITH_ANNOTATIONS,
+// METADATA_QUERY_WITH_SIGNAL_METADATA).
+//
+// `.create-or-alter external table` is idempotent, so this file is safe to re-run.
+// The column schema mirrors rayfin/data/Annotation.ts and rayfin/data/SignalMetadata.ts;
+// keep them in sync when those entities change.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// AnnotationsExternal: user-authored timeline annotations (RayFin Annotation).
+// ---------------------------------------------------------------------------
+.create-or-alter external table AnnotationsExternal (
+    id: string,
+    user_id: string,
+    annotation_type: string,
+    title: string,
+    detail: string,
+    timestamp: datetime,
+    end_timestamp: datetime,
+    scope_type: string,
+    scope_id: string,
+    connection_profile_id: string,
+    created_at: datetime
+)
+kind = delta
+(
+    h@'__ANNOTATIONS_DELTA_URI__'
+)
+with (docstring = "OneLake mirror of the RayFin Annotation table. Filter by connection_profile_id to scope to a profile.", folder = "OperationsIQ/External")
+
+// ---------------------------------------------------------------------------
+// SignalMetadataExternal: governed per-signal process-health metadata
+// (RayFin SignalMetadata). Filter to the effective row per signal with
+// `where status != "retired" | summarize arg_max(version, *) by signal_id`.
+// ---------------------------------------------------------------------------
+.create-or-alter external table SignalMetadataExternal (
+    id: string,
+    signal_id: string,
+    scope_key: string,
+    name: string,
+    operating_setpoint: real,
+    upper_operating_limit: real,
+    lower_operating_limit: real,
+    max_rate_of_change: real,
+    usl: real,
+    lsl: real,
+    target: real,
+    physical_min: real,
+    physical_max: real,
+    sensor_uncertainty: real,
+    active_baseline_id: string,
+    preferred_chart_type: string,
+    rule_profile: string,
+    recommended_alert_threshold: real,
+    recommended_confidence: real,
+    notes: string,
+    status: string,
+    version: long,
+    parent_id: string,
+    approved_by: string,
+    approved_at: datetime,
+    effective_from: datetime,
+    effective_to: datetime,
+    audit_json: string,
+    authored_by: string,
+    created_at: datetime,
+    updated_at: datetime
+)
+kind = delta
+(
+    h@'__SIGNAL_METADATA_DELTA_URI__'
+)
+with (docstring = "OneLake mirror of the RayFin SignalMetadata table. Filter by scope_key to scope to a profile.", folder = "OperationsIQ/External")

@@ -1,0 +1,16 @@
+# fabric-cicd parameterization for Operations IQ item deployment.
+#
+# fabric-cicd performs a full-state publish of the item definitions under
+# items/. Use this file for environment-specific find/replace substitutions
+# (e.g. pointing a Spark Job Definition at the deployed lakehouse id). Values are
+# resolved at publish time; leave empty to publish the definitions as-is.
+#
+# Docs: https://microsoft.github.io/fabric-cicd/
+
+find_replace: []
+
+# Example (uncomment + fill to bind the Spark Job Definition to a lakehouse):
+# find_replace:
+#   - find_value: "__LAKEHOUSE_ARTIFACT_ID__"
+#     replace_value:
+#       PROD: "00000000-0000-0000-0000-000000000000"

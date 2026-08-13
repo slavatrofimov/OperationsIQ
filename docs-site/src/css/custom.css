@@ -1,0 +1,68 @@
+/**
+ * Any CSS included here will be global. The classic template
+ * bundles Infima by default. Infima is a CSS framework designed to
+ * work well for content-centric websites.
+ */
+
+/* Operations IQ palette (Fabric-inspired blue). */
+:root {
+  --ifm-color-primary: #0f6cbd;
+  --ifm-color-primary-dark: #0e61aa;
+  --ifm-color-primary-darker: #0d5ca1;
+  --ifm-color-primary-darkest: #0b4c85;
+  --ifm-color-primary-light: #1277d0;
+  --ifm-color-primary-lighter: #167cd6;
+  --ifm-color-primary-lightest: #3691de;
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+}
+
+/* For readability concerns, you should choose a lighter palette in dark mode. */
+[data-theme='dark'] {
+  --ifm-color-primary: #59a8e8;
+  --ifm-color-primary-dark: #3f99e3;
+  --ifm-color-primary-darker: #3191e1;
+  --ifm-color-primary-darkest: #1a78c9;
+  --ifm-color-primary-light: #73b7ed;
+  --ifm-color-primary-lighter: #81beef;
+  --ifm-color-primary-lightest: #aad3f4;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+/* Card grid used by the <ModuleCards> MDX component. */
+.oiq-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.oiq-card {
+  display: block;
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: var(--ifm-card-border-radius, 8px);
+  background: var(--ifm-background-surface-color);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+  text-decoration: none !important;
+  color: inherit;
+}
+
+.oiq-card:hover {
+  border-color: var(--ifm-color-primary);
+  box-shadow: 0 4px 14px rgba(15, 108, 189, 0.12);
+  transform: translateY(-2px);
+}
+
+.oiq-card__title {
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+  color: var(--ifm-color-primary);
+}
+
+.oiq-card__desc {
+  font-size: 0.9rem;
+  color: var(--ifm-color-emphasis-700);
+  margin: 0;
+}
+

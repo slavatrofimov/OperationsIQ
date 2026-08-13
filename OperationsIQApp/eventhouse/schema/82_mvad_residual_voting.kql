@@ -1,0 +1,199 @@
+// ============================================================================
+// Residual magnitude plus voting
+// ----------------------------------------------------------------------------
+// PURPOSE
+//   Builds causal seasonal/trend residuals independently per prepared track,
+//   applies robust Tukey scoring, then combines the final interval with
+//   dimension-invariant RMS, scalable voting, and an extreme-track escape hatch.
+//
+// INTERPRETATION / MEMORY
+//   Causal FIR prediction and historical-only normalization ensure the final
+//   bins do not influence seasonal/trend fitting. Only those final score bins are
+//   expanded. Contributor bags retain at most five tracks per entity/bin.
+//
+// BEST FIT / LIMITS
+//   A cheap, explainable first-line detector for coordinated excursions. It does
+//   not model covariance, so use random projections for relationship-only breaks.
+//
+// EXAMPLE
+//   mvad_residual_magnitude_voting(
+//       SeriesTable, 30m, 0, "linefit", "ctukey",
+//       1.5, 1.2, 2, 0.5, 3.0, false)
+// ============================================================================
+
+.create-or-alter function with (
+    folder = "MVAD/Detectors",
+    docstring = "Detect coordinated causal seasonal/trend residual anomalies using robust magnitude, track votes, and bounded contributors."
+) mvad_residual_magnitude_voting(
+    SeriesTable:(
+        entity_id:string,
+        track_id:string,
+        series:dynamic,
+        series_start:datetime,
+        series_end:datetime,
+        bin_size:timespan,
+        point_count:long,
+        observed_bins:long,
+        coverage:real,
+        max_missing_run:long,
+        is_valid:bool,
+        validation_error:string
+    ),
+    detection_window:timespan,
+    seasonality:int,
+    trend:string,
+    outlier_kind:string,
+    feature_score_threshold:real,
+    residual_rms_threshold:real,
+    min_track_votes:int,
+    min_vote_fraction:real,
+    extreme_feature_threshold:real,
+    emit_all_scores:bool)
+{
+    let _parameters_are_valid = assert(
+        detection_window > 0s
+            and (seasonality == -1 or seasonality >= 0)
+            and trend in ("avg", "linefit", "none")
+            and outlier_kind in ("ctukey", "tukey")
+            and feature_score_threshold > 0.0
+            and residual_rms_threshold > 0.0
+            and min_track_votes >= 1
+            and min_vote_fraction > 0.0
+            and min_vote_fraction <= 1.0
+            and extreme_feature_threshold > 0.0,
+        "mvad_residual_magnitude_voting: invalid detection/decomposition, outlier, threshold, or vote parameter."
+    );
+    let _minimum_history = tolong(max_of(16, iff(seasonality > 0, seasonality * 2, 16)));
+    let _validated_series = SeriesTable | where _parameters_are_valid;
+    let _profiles =
+        materialize(
+            mvad_entity_profile(
+                _validated_series,
+                detection_window,
+                _minimum_history
+            )
+        );
+    let _track_evidence =
+        materialize(
+            SeriesTable
+            | join kind=inner (
+                _profiles
+                | where status == "ok"
+                | project
+                    entity_id,
+                    _profile_start = series_start,
+                    _profile_end = series_end,
+                    _profile_bin = bin_size,
+                    _profile_points = point_count,
+                    detection_bins,
+                    _profile_track_count = track_count
+            ) on entity_id
+            // Parameterized series_decompose_anomalies cannot be validated in a
+            // stored function because its optional arguments must be literals.
+            // The causal FIR residual plus historical-only normalization retains
+            // the important no-test-window-leakage property and remains row-safe.
+            | extend _residual = mvad_causal_residual(series, seasonality, trend)
+            | extend _standardized_residual =
+                mvad_standardize_from_history(_residual, toint(detection_bins), 1e-6)
+            // Keep the built-in kind arguments literal so this remains a
+            // deployable stored function; select the caller's requested score
+            // family after both vectorized arrays are computed.
+            | extend
+                _ctukey_scores = series_abs(series_outliers(_standardized_residual, "ctukey")),
+                _tukey_scores = series_abs(series_outliers(_standardized_residual, "tukey"))
+            | extend _anomaly_scores =
+                iff(outlier_kind == "tukey", _tukey_scores, _ctukey_scores)
+            | extend _tail_scores =
+                array_slice(_anomaly_scores, _profile_points - detection_bins, _profile_points - 1)
+            | mv-expand with_itemindex=_offset _raw_score = _tail_scores to typeof(real)
+            | extend
+                event_index = _profile_points - detection_bins + tolong(_offset),
+                feature_score = abs(todouble(_raw_score))
+            | where isfinite(feature_score)
+            | project
+                entity_id,
+                track_id,
+                event_index,
+                feature_score,
+                series_start = _profile_start,
+                series_end = _profile_end,
+                bin_size = _profile_bin,
+                track_count = _profile_track_count
+        );
+    let _scores =
+        materialize(
+            _track_evidence
+            | summarize
+                _sum_score_squared = sum(feature_score * feature_score),
+                _max_feature_score = max(feature_score),
+                vote_count = countif(feature_score >= feature_score_threshold),
+                series_start = any(series_start),
+                series_end = any(series_end),
+                bin_size = any(bin_size),
+                track_count = any(track_count)
+              by entity_id, event_index
+            | extend
+                score = sqrt(_sum_score_squared / todouble(track_count)),
+                vote_count = tolong(vote_count),
+                vote_fraction = todouble(vote_count) / todouble(track_count),
+                _required_votes = tolong(max_of(
+                    min_track_votes,
+                    ceiling(min_vote_fraction * todouble(track_count))
+                ))
+            | extend is_anomaly =
+                score >= residual_rms_threshold
+                or vote_count >= _required_votes
+                or _max_feature_score >= extreme_feature_threshold
+            | extend severity = max_of(
+                score / residual_rms_threshold,
+                todouble(vote_count) / todouble(_required_votes),
+                _max_feature_score / extreme_feature_threshold
+            )
+            | where emit_all_scores or is_anomaly
+        );
+    let _contributors =
+        _track_evidence
+        | join kind=inner (
+            _scores
+            | project entity_id, event_index
+        ) on entity_id, event_index
+        | order by entity_id asc, event_index asc, feature_score desc
+        | serialize _group = strcat(entity_id, "|", event_index)
+        | extend _rank = row_number(1, _group != prev(_group))
+        | where _rank <= 5
+        | summarize contributors = make_list(bag_pack(
+            "track_id", track_id,
+            "feature_score", feature_score,
+            "voted", feature_score >= feature_score_threshold
+        )) by entity_id, event_index;
+    let _results =
+        _scores
+        | join kind=leftouter _contributors on entity_id, event_index
+        | project
+            entity_id,
+            algorithm = "residual_voting",
+            event_index,
+            event_time = series_start + event_index * bin_size,
+            window_start = series_start + event_index * bin_size,
+            window_end = series_start + (event_index + 1) * bin_size,
+            score,
+            threshold = residual_rms_threshold,
+            severity,
+            is_anomaly,
+            vote_count,
+            vote_fraction,
+            track_count,
+            contributors = coalesce(contributors, dynamic([])),
+            status = "ok",
+            explain = bag_pack(
+                "feature_score_threshold", feature_score_threshold,
+                "required_votes", _required_votes,
+                "maximum_feature_score", _max_feature_score,
+                "outlier_kind", outlier_kind,
+                "seasonality", seasonality,
+                "trend", trend
+            );
+    let _diagnostics =
+        mvad_diagnostic_results(_profiles, "residual_voting");
+    union _results, _diagnostics
+}

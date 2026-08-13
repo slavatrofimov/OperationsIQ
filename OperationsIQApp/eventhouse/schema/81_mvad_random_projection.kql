@@ -1,0 +1,341 @@
+// ============================================================================
+// Deterministic sparse random-projection MVAD ensemble
+// ----------------------------------------------------------------------------
+// PURPOSE
+//   Detects multivariate relationship breaks by projecting historical-only
+//   standardized residuals onto a reproducible set of sparse Rademacher vectors.
+//
+// INTERPRETATION
+//   detection_window is the final interval to score. Residual construction is
+//   causal and normalization uses only the preceding history, preventing
+//   anomalies from defining their own baseline.
+//
+// BEST FIT / LIMITS
+//   Best for dozens of correlated telemetry tracks and relationship anomalies.
+//   Projection evidence is influence, not causal attribution. The basis changes
+//   if the track set changes, so any invalid track invalidates the whole entity.
+//
+// MEMORY BOUND
+//   SHA-derived zero weights are removed before scalar expansion. Actual sparse
+//   work (included track/projection rows times point count) is checked against
+//   max_work_rows. Entities stay together in native partitions, expanded values
+//   are immediately reduced to one projection/index scalar, and contributor
+//   reconstruction uses direct array indexing only for anomaly survivors.
+//
+// EXAMPLE
+//   mvad_random_projection_ensemble(
+//       SeriesTable, 30m, 0, "linefit", 32, 0.25, "ops-iq-v1",
+//       1.5, 1.2, 4, 3.0, 1e-6, 5000000, false)
+// ============================================================================
+
+.create-or-alter function with (
+    folder = "MVAD/Detectors",
+    docstring = "Detect multivariate anomalies with deterministic SHA-256-derived sparse random projections over standardized decomposition residuals."
+) mvad_random_projection_ensemble(
+    SeriesTable:(
+        entity_id:string,
+        track_id:string,
+        series:dynamic,
+        series_start:datetime,
+        series_end:datetime,
+        bin_size:timespan,
+        point_count:long,
+        observed_bins:long,
+        coverage:real,
+        max_missing_run:long,
+        is_valid:bool,
+        validation_error:string
+    ),
+    detection_window:timespan,
+    seasonality:int,
+    trend:string,
+    projection_count:int,
+    projection_density:real,
+    projection_seed:string,
+    projection_score_threshold:real,
+    projection_rms_threshold:real,
+    min_projection_votes:int,
+    extreme_projection_threshold:real,
+    stdev_floor:real,
+    max_work_rows:long,
+    emit_all_scores:bool)
+{
+    let _parameters_are_valid = assert(
+        detection_window > 0s
+            and (seasonality == -1 or seasonality >= 0)
+            and trend in ("avg", "linefit", "none")
+            and projection_count >= 2
+            and projection_count <= 512
+            and projection_density > 0.0
+            and projection_density <= 1.0
+            and strlen(projection_seed) > 0
+            and projection_score_threshold > 0.0
+            and projection_rms_threshold > 0.0
+            and min_projection_votes >= 1
+            and min_projection_votes <= projection_count
+            and extreme_projection_threshold > 0.0
+            and stdev_floor > 0.0
+            and max_work_rows >= 1,
+        "mvad_random_projection_ensemble: invalid detection/decomposition, projection, threshold, stdev_floor, or work-limit parameter."
+    );
+    let _minimum_history = tolong(max_of(16, iff(seasonality > 0, seasonality * 2, 16)));
+    let _validated_series = SeriesTable | where _parameters_are_valid;
+    let _profiles =
+        materialize(
+            mvad_entity_profile(
+                _validated_series,
+                detection_window,
+                _minimum_history
+            )
+        );
+    let _residual_tracks =
+        materialize(
+            SeriesTable
+            | join kind=inner (
+                _profiles
+                | where status == "ok"
+                | project entity_id, _detection_bins = detection_bins
+            ) on entity_id
+            | extend _residual = mvad_causal_residual(series, seasonality, trend)
+            | extend _standardized =
+                mvad_standardize_from_history(_residual, toint(_detection_bins), stdev_floor)
+            | project entity_id, track_id, _standardized
+        );
+    let _projection_ids =
+        range projection_id from 0 to projection_count - 1 step 1
+        | extend _join_key = 1;
+    let _candidate_weights =
+        materialize(
+            _residual_tracks
+            | extend _join_key = 1
+            | join kind=inner _projection_ids on _join_key
+            | project-away _join_key, _join_key1
+            | extend _hash = hash_sha256(strcat(projection_seed, "|", projection_id, "|", track_id))
+            | extend
+                // Byte zero supplies a uniform density gate. A separate digest
+                // nibble supplies the sign so sparsity and sign are independent.
+                _gate_byte =
+                    16 * mvad_hex_digit(substring(_hash, 0, 1))
+                    + mvad_hex_digit(substring(_hash, 1, 1)),
+                _sign_nibble = mvad_hex_digit(substring(_hash, 2, 1)),
+                _force_hash = hash_sha256(strcat(projection_seed, "|force|", projection_id, "|", track_id))
+            | extend
+                _include_from_gate = todouble(_gate_byte) / 256.0 < projection_density,
+                _raw_sign = iff(_sign_nibble % 2 == 0, 1.0, -1.0)
+            | project
+                entity_id,
+                track_id,
+                projection_id = tolong(projection_id),
+                _standardized,
+                _include_from_gate,
+                _raw_sign,
+                _force_hash
+        );
+    let _forced_tracks =
+        _candidate_weights
+        | summarize arg_min(_force_hash, track_id) by entity_id, projection_id
+        | project entity_id, projection_id, _forced_track_id = track_id;
+    let _weights =
+        materialize(
+            _candidate_weights
+            | join kind=inner _forced_tracks on entity_id, projection_id
+            // Force the deterministic minimum-hash track into a projection whose
+            // density gate otherwise selected nothing.
+            | extend _include = _include_from_gate or track_id == _forced_track_id
+            | where _include
+            | summarize
+                _included_track_count = count(),
+                _rows = make_list(bag_pack(
+                    "track_id", track_id,
+                    "sign", _raw_sign,
+                    "series", _standardized
+                ))
+              by entity_id, projection_id
+            | mv-expand _row = _rows to typeof(dynamic)
+            | extend
+                track_id = tostring(_row.track_id),
+                _standardized = todynamic(_row.series),
+                weight = todouble(_row.sign) / sqrt(todouble(_included_track_count))
+            | project entity_id, projection_id, track_id, weight, _standardized
+        );
+    let _work_by_entity =
+        _weights
+        | summarize _included_weight_rows = count() by entity_id
+        | join kind=inner (
+            _profiles
+            | project entity_id, point_count
+        ) on entity_id
+        | extend estimated_work_rows = tolong(_included_weight_rows) * point_count
+        | project entity_id, estimated_work_rows;
+    let _guarded_profiles =
+        materialize(
+            _profiles
+            | join kind=leftouter _work_by_entity on entity_id
+            | extend estimated_work_rows = coalesce(estimated_work_rows, tolong(0))
+            | extend
+                detail = iff(
+                    status == "ok" and estimated_work_rows > max_work_rows,
+                    strcat("Sparse projection expansion estimate ", estimated_work_rows, " exceeds max_work_rows ", max_work_rows, "."),
+                    detail
+                ),
+                status = iff(
+                    status == "ok" and estimated_work_rows > max_work_rows,
+                    "work_limit_exceeded",
+                    status
+                )
+            | project
+                entity_id, series_start, series_end, bin_size, point_count,
+                detection_bins, track_count, valid_track_count,
+                invalid_track_count, status, detail
+        );
+    let _weighted_tracks =
+        materialize(
+            _weights
+            | join kind=inner (
+                _guarded_profiles
+                | where status == "ok"
+                | project entity_id, point_count
+            ) on entity_id
+            | project entity_id, projection_id, track_id, weight, _standardized, point_count
+        );
+    let _bucket_plan =
+        materialize(
+            _weighted_tracks
+            | summarize _total_work = sum(point_count)
+            | extend
+                _join_key = 1,
+                _bucket_count = tolong(max_of(
+                    1,
+                    (_total_work + tolong(2000000) - 1) / tolong(2000000)
+                ))
+            | project _join_key, _bucket_count
+        );
+    let _projected_arrays =
+        _weighted_tracks
+        | extend _join_key = 1
+        | lookup kind=inner _bucket_plan on _join_key
+        | extend _batch = abs(hash(entity_id) % _bucket_count)
+        | project-away _join_key, _bucket_count
+        | partition hint.strategy=native by _batch (
+            mv-expand with_itemindex=_event_index _value = _standardized to typeof(real)
+            | extend _weighted_value = weight * _value
+            // Collapse expanded tracks immediately. No source array crosses this
+            // summarize boundary.
+            | summarize
+                _projection_value = sum(_weighted_value),
+                point_count = any(point_count)
+              by entity_id, projection_id, _event_index
+        )
+        | extend _event_index = tolong(_event_index)
+        | order by entity_id asc, projection_id asc, _event_index asc
+        | serialize
+        | summarize
+            _projection = make_list(_projection_value),
+            point_count = any(point_count)
+          by entity_id, projection_id;
+    let _projection_evidence =
+        materialize(
+            _projected_arrays
+            | extend _projection_scores = series_abs(series_outliers(_projection, "ctukey"))
+            | join kind=inner (
+                _guarded_profiles
+                | where status == "ok"
+                | project
+                    entity_id,
+                    series_start,
+                    series_end,
+                    bin_size,
+                    point_count,
+                    detection_bins,
+                    track_count
+            ) on entity_id, point_count
+            | extend _tail_scores =
+                array_slice(_projection_scores, point_count - detection_bins, point_count - 1)
+            | mv-expand with_itemindex=_offset _projection_score = _tail_scores to typeof(real)
+            | extend
+                event_index = point_count - detection_bins + tolong(_offset),
+                projection_score = abs(todouble(_projection_score))
+            | where isfinite(projection_score)
+            | project
+                entity_id, projection_id, event_index, projection_score,
+                series_start, series_end, bin_size, point_count,
+                detection_bins, track_count
+        );
+    let _scores =
+        materialize(
+            _projection_evidence
+            | summarize
+                _sum_score_squared = sum(projection_score * projection_score),
+                _max_projection_score = max(projection_score),
+                vote_count = countif(projection_score >= projection_score_threshold),
+                series_start = any(series_start),
+                series_end = any(series_end),
+                bin_size = any(bin_size),
+                track_count = any(track_count)
+              by entity_id, event_index
+            | extend
+                score = sqrt(_sum_score_squared / todouble(projection_count)),
+                vote_count = tolong(vote_count),
+                vote_fraction = todouble(vote_count) / todouble(projection_count)
+            | extend is_anomaly =
+                score >= projection_rms_threshold
+                or vote_count >= tolong(min_projection_votes)
+                or _max_projection_score >= extreme_projection_threshold
+            | extend severity = max_of(
+                score / projection_rms_threshold,
+                todouble(vote_count) / todouble(min_projection_votes),
+                _max_projection_score / extreme_projection_threshold
+            )
+            | where emit_all_scores or is_anomaly
+        );
+    let _contributors =
+        _weighted_tracks
+        | join kind=inner (
+            _scores
+            | where is_anomaly
+            | project entity_id, event_index
+        ) on entity_id
+        | extend _track_value = todouble(_standardized[toint(event_index)])
+        | extend _contribution = abs(weight * _track_value)
+        | order by entity_id asc, event_index asc, _contribution desc
+        | serialize _group = strcat(entity_id, "|", event_index)
+        | extend _rank = row_number(1, _group != prev(_group))
+        | where _rank <= 8
+        | summarize contributors = make_list(bag_pack(
+            "projection_id", projection_id,
+            "track_id", track_id,
+            "weight", weight,
+            "standardized_residual", _track_value,
+            "absolute_contribution", _contribution
+        )) by entity_id, event_index;
+    let _results =
+        _scores
+        | join kind=leftouter _contributors on entity_id, event_index
+        | project
+            entity_id,
+            algorithm = "random_projection",
+            event_index,
+            event_time = series_start + event_index * bin_size,
+            window_start = series_start + event_index * bin_size,
+            window_end = series_start + (event_index + 1) * bin_size,
+            score,
+            threshold = projection_rms_threshold,
+            severity,
+            is_anomaly,
+            vote_count,
+            vote_fraction,
+            track_count,
+            contributors = coalesce(contributors, dynamic([])),
+            status = "ok",
+            explain = bag_pack(
+                "projection_count", projection_count,
+                "projection_density", projection_density,
+                "projection_score_threshold", projection_score_threshold,
+                "minimum_projection_votes", min_projection_votes,
+                "maximum_projection_score", _max_projection_score,
+                "seed", projection_seed
+            );
+    let _diagnostics =
+        mvad_diagnostic_results(_guarded_profiles, "random_projection");
+    union _results, _diagnostics
+}

@@ -1,0 +1,234 @@
+// Result schema for Operations IQ (design spec §5.1).
+//
+// Spark writes MOMP / DAMP / overview outputs into these tables via the Kusto Spark
+// connector; the frontend reads them back with fast KQL range queries. Every table is
+// keyed by `jobId` and ordered by `idx` / `bucket` so "give me results between a and b
+// at zoom level z" is sub-second even over millions of rows.
+//
+// Apply against the target KQL database (Fabric KQL queryset or az kusto).
+
+// One row per subsequence index: the matrix profile and its nearest-neighbor index.
+// Motif = min(mp); discord = max(mp). `seriesId` discriminates the series for multi-series
+// (AB-join) jobs — 0 = series A, 1 = series B; null/absent for single-series jobs.
+.create-merge table mp_result (
+    jobId: string,
+    idx: long,
+    mp: real,
+    mpi: long,
+    seriesId: long,
+    ingestedAt: datetime
+)
+
+// Top-k motif pairs (rank 1 = strongest / smallest distance). For AB-join jobs `seriesA` /
+// `seriesB` record which series each endpoint (`idxA` / `idxB`) indexes (0 = A, 1 = B);
+// both are null/absent for single-series self-join motifs. For multidimensional (mSTAMP)
+// jobs `dims` is a comma-separated list of the participating channel indices (best-agreeing
+// first) and `numDims` their count; both null/absent for single- and two-series jobs.
+.create-merge table motif_pairs (
+    jobId: string,
+    rank: int,
+    idxA: long,
+    idxB: long,
+    dist: real,
+    subLen: int,
+    seriesA: long,
+    seriesB: long,
+    numDims: int,
+    dims: string,
+    ingestedAt: datetime
+)
+
+// Top-k discords (rank 1 = most anomalous / largest nearest-neighbor distance). `seriesId`
+// marks which series the novelty lives in for AB-join jobs (default 1 = comparison series B);
+// `numDims` records how many channels define a multidimensional (mSTAMP) novelty; all
+// null/absent for single-series jobs.
+.create-merge table discords (
+    jobId: string,
+    rank: int,
+    idx: long,
+    nnDist: real,
+    severity: real,
+    seriesId: long,
+    numDims: int,
+    ingestedAt: datetime
+)
+
+// Multi-resolution envelopes for fast charting. `level` 0 = finest; higher = coarser.
+// The UI selects `level` by zoom and fetches only the visible `bucket` range. `seriesId`
+// discriminates the series for multi-series (AB-join) jobs; null/absent for single-series.
+.create-merge table overview (
+    jobId: string,
+    level: int,
+    bucket: long,
+    tMin: real,
+    tMax: real,
+    tAvg: real,
+    startIdx: long,
+    seriesId: long,
+    ingestedAt: datetime
+)
+
+// Every occurrence of each motif's shape across the window — not just the matched pair.
+// `rank` ties each row back to the motif_pairs row of the same rank; `occurrence` is a
+// 0-based order within the motif (by index). `idx` is the window start on that series' own
+// clock and `dist` its z-normalized distance to the motif shape (0 for the seed endpoint).
+// `seriesId` marks which series an occurrence lives in for AB-join jobs (0 = A, 1 = B) and
+// is null/absent for single-series and multidimensional jobs (one shared clock). The SPA
+// reads this to draw *all* occurrences as color-coded bands when "Show all occurrences" is on.
+.create-merge table motif_occurrences (
+    jobId: string,
+    rank: int,
+    occurrence: int,
+    idx: long,
+    dist: real,
+    seriesId: long,
+    subLen: int,
+    ingestedAt: datetime
+)
+
+// --- Semantic segmentation (regime / mode changes, SEGMENTATION jobs) ---------------
+
+// Corrected Arc Curve: one row per subsequence index. Low `cac` marks a likely regime
+// boundary; the SPA draws this as the arc-curve lane under the signal.
+.create-merge table arc_curve (
+    jobId: string,
+    idx: long,
+    cac: real,
+    ingestedAt: datetime
+)
+
+// Detected regime change points (rank 1 = strongest / lowest CAC). `boundaryIdx` is the
+// subsequence index where the machine switches behavior.
+.create-merge table segments (
+    jobId: string,
+    rank: int,
+    boundaryIdx: long,
+    cac: real,
+    ingestedAt: datetime
+)
+
+// --- Slow degradation (Time-Series Chains, CHAIN jobs) ------------------------------
+
+// Ordered members of the evolving-motif chains. `chainRank` orders chains (1 = longest);
+// `linkOrder` orders members within a chain from head (earliest) to tail (latest).
+.create-merge table chain_links (
+    jobId: string,
+    chainRank: int,
+    linkOrder: int,
+    idx: long,
+    subLen: int,
+    ingestedAt: datetime
+)
+
+// --- Multidimensional participation (mSTAMP, MULTIDIM_* jobs) ------------------------
+
+// One row per channel that participated in a multidimensional motif or discord. `rank`
+// ties the row back to the motif_pairs / discords row of the same rank; `resultKind` is
+// "MOTIF" or "DISCORD"; `seriesId` is the channel (sensor) index and `dist` its
+// per-dimension z-normalized distance for the matched pair. The SPA reads this to draw
+// the motif span across participating sensor lanes and dim the rest.
+.create-merge table md_dimensions (
+    jobId: string,
+    rank: int,
+    resultKind: string,
+    seriesId: long,
+    dist: real,
+    included: bool,
+    ingestedAt: datetime
+)
+
+// --- Fleet consensus (Ostinato, CONSENSUS_MOTIF jobs) -------------------------------
+
+// One row per series in a fleet consensus motif. `rank` ties rows of the same consensus
+// result together (1 = top consensus); `seriesId` (0..N-1) maps to the job's ordered
+// signal list; `idx` is where the shared shape occurs in that series; `dist` its
+// z-normalized distance from the central shape (0 for the central series); `isCentral`
+// flags the reference series the others match. The SPA reads this to highlight the
+// consensus shape across each fleet lane.
+.create-merge table consensus_members (
+    jobId: string,
+    rank: int,
+    seriesId: long,
+    idx: long,
+    dist: real,
+    isCentral: bool,
+    ingestedAt: datetime
+)
+
+// Best-so-far progress snapshots streamed by the Spark job while it runs (design spec
+// §6.6, §7.2). One row per improving MOMP level: the convergence pct, a human stage, and
+// the current best motif (so the SPA can draw a live/partial motif and keep it if the user
+// stops early). The SPA reads the latest row by `updatedAt`. Kept separate from
+// `motif_pairs` so streaming snapshots never pollute the final result table.
+.create-merge table job_progress (
+    jobId: string,
+    pct: real,
+    stage: string,
+    bestDist: real,
+    bestIdxA: long,
+    bestIdxB: long,
+    subLen: int,
+    updatedAt: datetime
+)
+
+// Batch ingest that lands within seconds so results feel interactive after a job.
+.alter table mp_result policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+.alter table motif_pairs policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+.alter table motif_occurrences policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+.alter table discords policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+.alter table overview policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+.alter table arc_curve policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+.alter table segments policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+.alter table chain_links policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+.alter table md_dimensions policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+.alter table consensus_members policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":25000}'
+// Progress snapshots must land fast to feel "live", so batch as tightly as the service allows.
+.alter table job_progress policy ingestionbatching '{"MaximumBatchingTimeSpan":"00:00:10","MaximumNumberOfItems":1}'
+
+// Streaming ingestion — near-real-time writes for the small result tables.
+//
+// The Spark connector (tsmp/io/kusto.py) uses a ManagedStreamingIngestClient, which
+// streams payloads under the 4 MB streaming limit and falls back to the queued
+// (batched) path above for anything larger. Enabling the streaming ingestion policy
+// on these tables lets the tiny result sets a pattern search produces (motif pairs,
+// discords, segments, progress snapshots, ...) land within a second or two instead of
+// waiting out the queued batching window + queue latency — which is what made the SPA
+// hang on "Finalizing results — waiting for them to become queryable".
+//
+// PREREQUISITE: streaming ingestion must also be enabled at the Eventhouse / KQL
+// database level (Fabric: Eventhouse "Streaming ingestion" setting; ADX: enable on the
+// cluster). The table policy alone is not sufficient. Enabling `.alter database`
+// streaming ingestion turns it on for all tables at once; the per-table statements
+// below are for table-level enablement.
+//
+// mp_result is intentionally left on the queued path only: it can hold one row per
+// index (well over the 4 MB streaming limit for long windows) and is not part of the
+// "results are queryable" gate, so streaming it would only spend hot-cache SSD for no
+// interactive benefit (the managed client still queues it correctly).
+.alter table motif_pairs policy streamingingestion enable
+.alter table motif_occurrences policy streamingingestion enable
+.alter table discords policy streamingingestion enable
+.alter table overview policy streamingingestion enable
+.alter table arc_curve policy streamingingestion enable
+.alter table segments policy streamingingestion enable
+.alter table chain_links policy streamingingestion enable
+.alter table md_dimensions policy streamingingestion enable
+.alter table consensus_members policy streamingingestion enable
+.alter table job_progress policy streamingingestion enable
+
+// --- Folder organization -----------------------------------------------------------
+// Group the matrix-profile result tables under a single "Pattern Analysis" tree so they
+// no longer clutter the KQL database root, matching how the raw-data tables live under
+// "OperationsIQ/Data". Uses .alter table ... folder (not create-merge) so it also
+// reorganizes tables that already exist in a deployed database.
+.alter table mp_result folder "OperationsIQ/Pattern Analysis/Core"
+.alter table motif_pairs folder "OperationsIQ/Pattern Analysis/Core"
+.alter table motif_occurrences folder "OperationsIQ/Pattern Analysis/Core"
+.alter table discords folder "OperationsIQ/Pattern Analysis/Core"
+.alter table overview folder "OperationsIQ/Pattern Analysis/Core"
+.alter table arc_curve folder "OperationsIQ/Pattern Analysis/Segmentation"
+.alter table segments folder "OperationsIQ/Pattern Analysis/Segmentation"
+.alter table chain_links folder "OperationsIQ/Pattern Analysis/Chains"
+.alter table md_dimensions folder "OperationsIQ/Pattern Analysis/Multidimensional"
+.alter table consensus_members folder "OperationsIQ/Pattern Analysis/Consensus"
+.alter table job_progress folder "OperationsIQ/Pattern Analysis/Progress"

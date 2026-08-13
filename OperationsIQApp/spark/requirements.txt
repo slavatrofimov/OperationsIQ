@@ -1,0 +1,9 @@
+# Compute-core runtime + test dependencies (P1 + P2).
+numpy>=1.24
+scipy>=1.10
+# Distributed execution (P2) — only needed to run on Spark; the pure decomposition
+# and its parity tests run without it:
+pyspark>=3.4
+# Test-only (independent oracle for matrix-profile parity):
+pytest>=7
+stumpy>=1.12

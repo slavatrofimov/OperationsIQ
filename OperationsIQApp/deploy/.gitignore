@@ -1,0 +1,16 @@
+# Inter-module handoff (generated at deploy time — never commit real values)
+outputs/*.json
+!outputs/.gitkeep
+
+# Terraform state + local dirs
+terraform/**/.terraform/
+terraform/**/.terraform.lock.hcl
+terraform/**/*.tfstate
+terraform/**/*.tfstate.*
+terraform/**/*.tfvars
+!terraform/**/*.tfvars.example
+crash.log
+
+# Python
+**/__pycache__/
+*.pyc

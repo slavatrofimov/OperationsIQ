@@ -1,0 +1,52 @@
+{
+  "name": "operations-iq",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Operations IQ: a Fabric app for operational intelligence, signal exploration, forecasting, pattern discovery, anomaly detection, and investigations.",
+  "scripts": {
+    "bundle:tsmp": "node scripts/bundle-tsmp.mjs",
+    "bundle:tsmp:check": "node scripts/bundle-tsmp.mjs --check",
+    "predev": "node scripts/bundle-tsmp.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/bundle-tsmp.mjs",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "perf:catalog": "vite-node scripts/catalog-perf-harness.ts",
+    "rayfin:up": "rayfin up",
+    "rayfin:db:apply": "rayfin up db apply",
+    "agent:emit": "vite-node --config scripts/provision.vite.config.ts scripts/provision-foundry-agent.ts -- --emit",
+    "agent:provision": "vite-node --config scripts/provision.vite.config.ts scripts/provision-foundry-agent.ts -- --provision",
+    "sample:gen": "python scripts/generate-sample-data.py",
+    "deploy": "pwsh -File deploy/Deploy-All.ps1"
+  },
+  "dependencies": {
+    "@azure/msal-browser": "^4.0.0",
+    "@fluentui/react-components": "^9.54.0",
+    "@microsoft/rayfin-auth-provider-fabric": "~1.33.2",
+    "@microsoft/rayfin-client": "~1.33.2",
+    "@microsoft/rayfin-core": "~1.33.2",
+    "echarts": "^6.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
+  },
+  "devDependencies": {
+    "@microsoft/rayfin-cli": "~1.33.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/turndown": "^5.0.6",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vite-node": "^2.1.8",
+    "vitest": "^2.1.8"
+  }
+}
