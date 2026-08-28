@@ -185,7 +185,7 @@ describe('withTimeseriesRef — wide binding', () => {
     expect(csl).not.toContain('materialize((');
   });
 
-  it('applies the tz shift BEFORE the time filter when offset != 0', () => {
+  it('applies the time filter BEFORE the tz shift when offset != 0 (index pushdown)', () => {
     offsetMinutes.mockReturnValue(60);
     const scope = { signalIds: ['P-Temp', 'P-Press'], start, end };
     const csl = withTimeseriesRef('Timeseries', 'WideBase', scope, wide);
@@ -193,7 +193,13 @@ describe('withTimeseriesRef — wide binding', () => {
     const filterIdx = csl.indexOf('where Timestamp between');
     expect(shiftIdx).toBeGreaterThan(-1);
     expect(filterIdx).toBeGreaterThan(-1);
-    expect(shiftIdx).toBeLessThan(filterIdx);
+    // Filter the raw, indexed source column first...
+    expect(filterIdx).toBeLessThan(shiftIdx);
+    // ...using RAW UTC bounds (not shifted by +60m), since they are compared
+    // against the source's unshifted Timestamp.
+    expect(csl).toContain(
+      'where Timestamp between (datetime(2024-01-01T00:00:00.000Z) .. datetime(2024-01-02T00:00:00.000Z))',
+    );
   });
 
   it('does not emit a tz shift when offset is 0', () => {
@@ -363,14 +369,15 @@ describe('buildMaxTagCountQuery — wide profile (pre-unpivot count)', () => {
     expect(csl).not.toContain('toreal(');
   });
 
-  it('wide: applies the tz shift BEFORE the time filter when offset != 0', () => {
+  it('wide: applies the time filter BEFORE the tz shift when offset != 0', () => {
     isWideFn.mockReturnValue(true);
     offsetMinutes.mockReturnValue(90);
     const csl = buildMaxTagCountQuery(opts);
     const shiftIdx = csl.indexOf("datetime_add('minute', 90, Timestamp)");
     const filterIdx = csl.indexOf('where Timestamp between');
     expect(shiftIdx).toBeGreaterThan(-1);
-    expect(shiftIdx).toBeLessThan(filterIdx);
+    expect(filterIdx).toBeGreaterThan(-1);
+    expect(filterIdx).toBeLessThan(shiftIdx);
   });
 });
 

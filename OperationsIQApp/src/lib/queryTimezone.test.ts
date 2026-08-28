@@ -51,6 +51,29 @@ describe('query timezone offset in the KQL layer', () => {
     expect(csl).toContain("datetime_add('minute', -480, Timestamp)");
     expect(csl).toContain('let Timeseries = (_TimeseriesBase | extend Timestamp =');
     expect(csl.endsWith('PROJECT')).toBe(true);
+    // No scope supplied -> nothing to push down.
+    expect(csl).not.toContain('where Timestamp between');
+  });
+
+  it('pushes the window onto the raw Timestamp ahead of the shift when scoped', () => {
+    setQueryOffsetMinutes(-480); // UTC-8
+    const csl = withTimeseriesRef('PROJECT', 'Timeseries', { signalIds: ['sig1'], start, end });
+    // The pre-filter compares the source's UNSHIFTED column, so its bounds stay raw UTC.
+    expect(csl).toContain(
+      'where Timestamp between (datetime(2024-01-01T00:00:00.000Z) .. datetime(2024-01-02T00:00:00.000Z))',
+    );
+    // ...and it precedes the extend, so Kusto's datetime index still applies.
+    const filterIdx = csl.indexOf('where Timestamp between');
+    const shiftIdx = csl.indexOf("datetime_add('minute', -480, Timestamp)");
+    expect(filterIdx).toBeGreaterThan(-1);
+    expect(shiftIdx).toBeGreaterThan(-1);
+    expect(filterIdx).toBeLessThan(shiftIdx);
+  });
+
+  it('emits neither a pre-filter nor a shift at offset 0 even when scoped', () => {
+    setQueryOffsetMinutes(0);
+    const csl = withTimeseriesRef('PROJECT', 'Timeseries', { signalIds: ['sig1'], start, end });
+    expect(csl).toBe('PROJECT');
   });
 
   it('keeps literal and column shifts consistent in a full binned-series query', () => {
@@ -65,6 +88,11 @@ describe('query timezone offset in the KQL layer', () => {
     // Both the where/make-series bounds and the source column are shifted by -8h.
     expect(q).toContain('datetime(2023-12-31T16:00:00.000Z)'); // start - 8h
     expect(q).toContain("datetime_add('minute', -480, Timestamp)");
+    // The pushed-down source guard keeps the RAW bounds. Both filters select the
+    // same rows: T + off in [s + off, e + off]  <=>  T in [s, e].
+    expect(q).toContain(
+      'where Timestamp between (datetime(2024-01-01T00:00:00.000Z) .. datetime(2024-01-02T00:00:00.000Z))',
+    );
   });
 
   it('shifts event timestamps at the Events binding', () => {

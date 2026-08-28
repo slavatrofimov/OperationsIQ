@@ -248,10 +248,13 @@ reference unchanged. It is **performance-first** — filters and projections are
 as early as possible so columns/rows the analysis will not use are never materialized:
 
 1. run the user's base wide query;
-2. shift `Timestamp` into the preferred timezone (offset ≠ 0 only) — applied *before*
-   the time filter so shifted-literal comparisons stay consistent with narrow mode;
-3. early `where Timestamp between (window)` (from the scope);
-4. early `where SignalIdPrefix in (<distinct in-scope prefixes>)`;
+2. early `where Timestamp between (window)` (from the scope) — emitted with **raw UTC**
+   literals so it compares the source's *unshifted* `Timestamp` and Kusto's datetime
+   index / extent elimination still applies;
+3. early `where SignalIdPrefix in (<distinct in-scope prefixes>)`;
+4. shift `Timestamp` into the preferred timezone (offset ≠ 0 only) — applied *after* the
+   pre-filters (so only surviving rows are shifted) but *before* any binning, so
+   `bin_at`/`bin`/`hourofday` align to the preferred zone's wall clock;
 5. early `project SignalIdPrefix, Timestamp, <distinct in-scope value columns>` —
    drops value columns no in-scope signal references, so the materialized set is as
    narrow as possible;
@@ -260,6 +263,14 @@ as early as possible so columns/rows the analysis will not use are never materia
    `SignalId = strcat(SignalIdPrefix, "<delim>", "Col")`, `Value = toreal(['Col'])`
    (so the union is bounded by column count, not signal count);
 8. final `where SignalId in (<exact in-scope ids>)`.
+
+The narrow path applies the same pushdown: `withTimeseriesRef` emits
+`| where Timestamp between (<raw UTC bounds>)` ahead of the `| extend Timestamp = …`
+shift whenever a scope is supplied. Downstream builders still re-filter the shifted
+column with shifted literals; because `T + offset ∈ [s + offset, e + offset]` is
+equivalent to `T ∈ [s, e]`, the pre-filter selects exactly the same rows and is purely
+a cost optimization. `scope` is a covering bound of everything a builder reads (see
+`tsScope` / `tsScope2`).
 
 **Adaptive pre-aggregation (dense-data optimization).** For adaptive-binned analyses
 — those whose whole `Timeseries` consumption is a single `make-series`/`summarize` at

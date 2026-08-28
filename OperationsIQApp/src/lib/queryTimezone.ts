@@ -18,6 +18,13 @@
  * bin()/make-series/hourofday/dayofweek/startofday all align to the preferred
  * zone's wall clock.
  *
+ * For performance the source binding *also* emits an early
+ * `where Timestamp between (<raw UTC bounds>)` ahead of the shift (when the
+ * builder supplies a scope). Filtering an `extend`-redefined column happens after
+ * the scan and would forfeit Kusto's datetime index / extent elimination; the raw
+ * pre-filter is algebraically identical (`T + off ∈ [s + off, e + off]` ⟺
+ * `T ∈ [s, e]`), so it changes cost, never results.
+ *
  * A FIXED offset is used (no DST): KQL/Eventhouse has no reliable IANA timezone
  * conversion, so a site spanning a daylight-saving change will be off by an hour
  * in the affected period. This is a documented, pragmatic trade-off.
