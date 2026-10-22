@@ -56,6 +56,16 @@ export function kqlDatetime(d: Date): string {
   return `datetime(${shifted.toISOString()})`;
 }
 
+/**
+ * KQL datetime() literal in RAW UTC — deliberately *not* shifted by the analysis
+ * timezone offset. Used only for the early window pre-filter that runs against the
+ * source's original `Timestamp`, before the shift applied in
+ * {@link withTimeseriesRef}.
+ */
+function kqlDatetimeUtc(d: Date): string {
+  return `datetime(${d.toISOString()})`;
+}
+
 /** Validated real number literal (guards against injection via NaN/Infinity/strings). */
 export function kqlNum(n: number): string {
   if (typeof n !== 'number' || !Number.isFinite(n)) {
@@ -86,11 +96,17 @@ export function kqlInt(n: number): string {
  * any default/raw schema.
  *
  * When a non-UTC query timezone offset is active, the canonical `Timestamp`
- * column is shifted by +offset here so every downstream operation (filters,
- * bin/make-series, hourofday/dayofweek/startofday) computes in the preferred
+ * column is shifted by +offset here so every downstream operation
+ * (bin/make-series, hourofday/dayofweek/startofday) computes in the preferred
  * zone's wall clock. The datetime literals compared against it are shifted by
  * the same amount in {@link kqlDatetime}, so row selection is unchanged while
  * bin alignment moves to the preferred zone.
+ *
+ * For performance the window is *also* pushed down onto the source's raw,
+ * unshifted `Timestamp` (with raw UTC literals) ahead of that shift whenever a
+ * `scope` is supplied — filtering an `extend`-redefined column is evaluated after
+ * the scan and would forfeit Kusto's datetime index / extent elimination. The two
+ * filters are algebraically identical, so this changes cost, never results.
  */
 export function withTimeseriesRef(
   csl: string,
@@ -135,7 +151,20 @@ export function withTimeseriesRef(
   // canonical `Timeseries` from it. The intermediate avoids a self-referential
   // `let Timeseries = (Timeseries | …)` when the source is the raw table name.
   const shift = `datetime_add('minute', ${kqlInt(offset)}, Timestamp)`;
-  return `let _TimeseriesBase = (\n${trimmed}\n);\nlet Timeseries = (_TimeseriesBase | extend Timestamp = ${shift});\n${csl}`;
+  const shiftClause = `| extend Timestamp = ${shift}`;
+  // Push the window down onto the source's RAW `Timestamp` (raw UTC literals)
+  // *ahead* of the shift. A filter on a column that `extend` has redefined is
+  // evaluated after the scan, forfeiting Kusto's datetime index and extent
+  // elimination — the dominant cost on long histories. Downstream builders still
+  // re-filter the shifted column with shifted literals; because
+  // `T + offset ∈ [s + offset, e + offset]` ⟺ `T ∈ [s, e]`, this pre-filter selects
+  // exactly the same rows and is purely an optimization. `scope` is a covering
+  // bound of everything the builder reads (see tsScope / tsScope2) — the wide path
+  // already depends on that invariant.
+  const body = scope
+    ? `_TimeseriesBase\n  | where Timestamp between (${kqlDatetimeUtc(scope.start)} .. ${kqlDatetimeUtc(scope.end)})\n  ${shiftClause}`
+    : `_TimeseriesBase ${shiftClause}`;
+  return `let _TimeseriesBase = (\n${trimmed}\n);\nlet Timeseries = (${body});\n${csl}`;
 }
 
 /** Default Signal Id delimiter for wide time-series profiles (mirrors connectionProfile.ts). */
@@ -287,7 +316,11 @@ function buildWideTimeseriesBinding(
     offset === 0
       ? ''
       : `\n  | extend Timestamp = datetime_add('minute', ${kqlInt(offset)}, Timestamp)`;
-  const timeFilter = `\n  | where Timestamp between (${kqlDatetime(scope.start)} .. ${kqlDatetime(scope.end)})`;
+  // RAW UTC literals: this filter runs against the source's original `Timestamp`,
+  // *before* the shift below, so Kusto's datetime index and extent elimination
+  // still apply. Equivalent to filtering the shifted column with shifted literals
+  // (both sides move by the same offset), but without defeating the index.
+  const timeFilter = `\n  | where Timestamp between (${kqlDatetimeUtc(scope.start)} .. ${kqlDatetimeUtc(scope.end)})`;
   const prefixFilter = `\n  | where SignalIdPrefix in (${kqlStringArray(prefixes)})`;
   // Reduce the pre-filtered wide subset before materializing. Without a pre-agg
   // hint, keep only the fixed columns + the distinct in-scope value columns so the
@@ -302,7 +335,11 @@ function buildWideTimeseriesBinding(
         .join(', ')} by SignalIdPrefix, Timestamp = bin_at(Timestamp, ${preAgg.binKql}, ${kqlDatetime(scope.start)})`
     : `\n  | project SignalIdPrefix, Timestamp, ${columns.map(kqlColumn).join(', ')}`;
   const baseBinding = `let _TimeseriesBase = (\n${base}\n);`;
-  const wb = `let _wb = materialize(\n  _TimeseriesBase${shift}${timeFilter}${prefixFilter}${reduce}\n);`;
+  // Order matters: both pre-filters run against raw, indexed source columns; the
+  // tz shift is then applied only to the surviving rows, still ahead of `reduce`
+  // so `bin_at` (and every downstream bin/hourofday/startofday) aligns to the
+  // preferred zone's wall clock.
+  const wb = `let _wb = materialize(\n  _TimeseriesBase${timeFilter}${prefixFilter}${shift}${reduce}\n);`;
   const legs = columns
     .map(
       (col) =>
@@ -533,16 +570,23 @@ function resolveWideProbe(
  * Build the two parts of a wide-native probe scan: the top-level
  * `let _TimeseriesBase = (…);` binding (which must stay OUTSIDE any
  * `materialize(...)` — a `let` is illegal inside a function-call argument), and
- * the filtered pipeline body that reads it: shift the timestamp into the query
- * zone (offset ≠ 0 only) and apply the early time + `SignalIdPrefix`
- * pre-filters. Callers append the probe-specific `summarize`. This is a
- * streaming scan of the wide table — no `materialize` of raw rows, no unpivot —
- * so it stays well under the materialize cap even on very dense sources.
+ * the filtered pipeline body that reads it: apply the early time +
+ * `SignalIdPrefix` pre-filters, then shift the timestamp into the query zone
+ * (offset ≠ 0 only). Callers append the probe-specific `summarize`.
+ *
+ * The time filter uses RAW UTC bounds against the source's unshifted `Timestamp`
+ * and runs *before* the shift, so Kusto's datetime index / extent elimination
+ * still applies — this is a full-window scan, so that pruning is the dominant
+ * cost factor. The shift still precedes the caller's `summarize`, so aggregates
+ * over `Timestamp` (e.g. coverage's `FirstTs`/`LastTs`) report the preferred
+ * zone's wall clock. This is a streaming scan of the wide table — no
+ * `materialize` of raw rows, no unpivot — so it stays well under the materialize
+ * cap even on very dense sources.
  */
 function buildWideProbeScan(
   w: { base: string; prefixes: string[]; offset: number },
-  from: string,
-  to: string,
+  start: Date,
+  end: Date,
 ): { baseBinding: string; filtered: string } {
   const shift =
     w.offset === 0
@@ -550,9 +594,9 @@ function buildWideProbeScan(
       : `\n| extend Timestamp = datetime_add('minute', ${kqlInt(w.offset)}, Timestamp)`;
   return {
     baseBinding: `let _TimeseriesBase = (\n${w.base}\n);`,
-    filtered: `_TimeseriesBase${shift}
-| where Timestamp between (${from} .. ${to})
-| where SignalIdPrefix in (${kqlStringArray(w.prefixes)})`,
+    filtered: `_TimeseriesBase
+| where Timestamp between (${kqlDatetimeUtc(start)} .. ${kqlDatetimeUtc(end)})
+| where SignalIdPrefix in (${kqlStringArray(w.prefixes)})${shift}`,
   };
 }
 
@@ -581,15 +625,15 @@ function buildWideProbeScan(
  * materializes or unpivots raw rows (see {@link buildWideProbeScan}).
  */
 export function buildMaxTagCountQuery(o: RawCountOptions): string {
-  const from = kqlDatetime(o.start);
-  const to = kqlDatetime(o.end);
   const wide = resolveWideProbe(o);
   if (wide) {
-    const { baseBinding, filtered } = buildWideProbeScan(wide, from, to);
+    const { baseBinding, filtered } = buildWideProbeScan(wide, o.start, o.end);
     return `${baseBinding}\n${filtered}
 | summarize Cnt = count() by SignalIdPrefix
 | summarize MaxTagCount = max(Cnt)`;
   }
+  const from = kqlDatetime(o.start);
+  const to = kqlDatetime(o.end);
   const csl = `Timeseries
 | where SignalId in (${kqlStringArray(o.tagIds)})
 | where Timestamp between (${from} .. ${to})
@@ -614,10 +658,10 @@ export function buildMaxTagCountQuery(o: RawCountOptions): string {
  * each derived signal); `AvgV` is recovered as `sum/count`.
  */
 export function buildCoverageQuery(o: RawCountOptions): string {
+  const wide = resolveWideProbe(o);
+  if (wide) return buildWideCoverageQuery(o, wide);
   const from = kqlDatetime(o.start);
   const to = kqlDatetime(o.end);
-  const wide = resolveWideProbe(o);
-  if (wide) return buildWideCoverageQuery(o, wide, from, to);
   const csl = `Timeseries
 | where SignalId in (${kqlStringArray(o.tagIds)})
 | where Timestamp between (${from} .. ${to})
@@ -637,8 +681,6 @@ export function buildCoverageQuery(o: RawCountOptions): string {
 function buildWideCoverageQuery(
   o: RawCountOptions,
   w: { base: string; delim: string; prefixes: string[]; columns: string[]; offset: number },
-  from: string,
-  to: string,
 ): string {
   // Per-column aggregates, aliased by column index so arbitrary column names
   // (spaces/specials) can't collide or need identifier-quoting on the alias.
@@ -648,7 +690,7 @@ function buildWideCoverageQuery(
       return `c${i}_cnt = count(${col}), c${i}_min = min(${col}), c${i}_max = max(${col}), c${i}_sum = sum(${col})`;
     })
     .join(',\n    ');
-  const { baseBinding, filtered } = buildWideProbeScan(w, from, to);
+  const { baseBinding, filtered } = buildWideProbeScan(w, o.start, o.end);
   const agg = `${baseBinding}\nlet _wcov = materialize(\n${filtered}
 | summarize FirstTs = min(Timestamp), LastTs = max(Timestamp),
     ${aggs}
